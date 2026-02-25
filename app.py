@@ -5,19 +5,15 @@ import os
 import io
 import zipfile
 import json
-import easyocr
+import pytesseract
+from pytesseract import Output
 import re
 
 # --- CONFIGURAZIONE ---
-st.set_page_config(page_title="PhotoBook Mockup - V12 OCR", layout="wide")
+st.set_page_config(page_title="PhotoBook Mockup - V13 TESSERACT", layout="wide")
 
 if 'uploader_key' not in st.session_state:
     st.session_state.uploader_key = 0
-
-# --- READER OCR (Cache per non esplodere la memoria) ---
-@st.cache_resource
-def get_ocr_reader():
-    return easyocr.Reader(['it', 'en'], gpu=False)
 
 # --- ANTI-CACHE ---
 def get_folder_hash(folder_path):
@@ -154,79 +150,70 @@ def composite_v3_fixed(tmpl_pil, cover_pil, template_name="", border_offset=None
     return tmpl_rgb
 
 
-# --- NUOVA FUNZIONE BLINDATA CON OCR ---
+# --- FUNZIONE OCR LEGGERA (TESSERACT) ---
 def elabora_testo_dinamico(img_pil, azione="Rimuovi", new_text_str="", font_obj=None, x_offset=0, y_offset=0):
-    """
-    Trova l'anno (pattern 20XX) tramite OCR e lo sostituisce con new_text_str.
-    Allineamento a destra rispetto al bounding box trovato.
-    Non tocca NULLA se non trova un anno valido.
-    """
     if azione == "Nessuna modifica":
         return img_pil
         
     img = img_pil.convert("RGB")
-    img_arr = np.array(img)
-    h, w = img_arr.shape[:2]
+    w, h = img.size
     
-    # Cerchiamo l'anno SOLO nella metà inferiore dell'immagine
-    # per evitare di toccare il titolo grande in alto
-    crop_y_start = h // 3  # dal terzo in giù
+    # Tagliamo la parte alta per non confondere l'OCR col titolo e risparmiare memoria
+    crop_y_start = h // 2 
     img_crop = img.crop((0, crop_y_start, w, h))
     
-    reader = get_ocr_reader()
-    results = reader.readtext(np.array(img_crop))
+    # Convertiamo in scala di grigi per aiutare Tesseract a leggere meglio
+    gray_crop = img_crop.convert('L')
     
-    # Troviamo tutti i testi che matchano un anno tipo 2020-2029
+    try:
+        # Tesseract estrae un dizionario con coordinate e testi
+        data = pytesseract.image_to_data(gray_crop, output_type=Output.DICT)
+    except Exception as e:
+        st.error(f"Errore OCR Tesseract. Assicurati che packages.txt sia stato creato! Errore: {e}")
+        return img_pil
+    
     anno_pattern = re.compile(r'\b20[0-9]{2}\b')
     target = None
     
-    for (bbox_points, text, confidence) in results:
-        if confidence < 0.3:
-            continue
-        # bbox_points è una lista di 4 punti [[x1,y1],[x2,y1],[x2,y2],[x1,y2]]
-        if anno_pattern.search(text.strip()):
-            # Convertiamo in xmin, ymin, xmax, ymax
-            xs = [p[0] for p in bbox_points]
-            ys = [p[1] for p in bbox_points]
-            xmin, xmax = int(min(xs)), int(max(xs))
-            ymin, ymax = int(min(ys)), int(max(ys))
-            
-            # Riadattiamo le coordinate al crop (aggiungiamo crop_y_start)
-            ymin += crop_y_start
-            ymax += crop_y_start
-            
-            # Prendiamo il più in basso a destra (l'anno sulla copertina)
-            if target is None or (ymax + xmax) > (target[3] + target[2]):
-                target = (xmin, ymin, xmax, ymax)
+    for i in range(len(data['text'])):
+        # Ignora i risultati con confidenza troppo bassa
+        if int(data['conf'][i]) > 30:
+            testo = data['text'][i].strip()
+            if anno_pattern.search(testo):
+                x, y, tw, th = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
                 
+                # Riportiamo le coordinate all'immagine intera
+                ymin = y + crop_y_start
+                ymax = ymin + th
+                xmin = x
+                xmax = x + tw
+                
+                # Prendi quello più in basso a destra
+                if target is None or (ymax + xmax) > (target[3] + target[2]):
+                    target = (xmin, ymin, xmax, ymax)
+                    
     if target is None:
-        # Non ha trovato nessun anno -> non tocca nulla
-        st.info("Nessun anno trovato tramite OCR. Immagine lasciata intatta.")
+        st.info("Nessun anno trovato. Immagine lasciata intatta.")
         return img_pil
         
     xmin, ymin, xmax, ymax = target
-    padding = 4
+    padding = 6
+    img_arr = np.array(img)
     
-    # Campiona il colore di sfondo vicino al testo trovato
-    # Prendiamo i pixel appena sopra il bounding box
-    sample_y = max(0, ymin - 5)
+    # Campiona il colore di sfondo vicino al testo
+    sample_y = max(0, ymin - 10)
     sample_x = max(0, xmin)
     bg_color = tuple(img_arr[sample_y, sample_x])
     
     draw = ImageDraw.Draw(img)
     
-    # --- CANCELLA L'ANNO ---
-    draw.rectangle(
-        [xmin - padding, ymin - padding, xmax + padding, ymax + padding],
-        fill=bg_color
-    )
+    # CANCELLA L'ANNO
+    draw.rectangle([xmin - padding, ymin - padding, xmax + padding, ymax + padding], fill=bg_color)
     
-    # --- SCRIVI IL NUOVO TESTO (se richiesto) ---
+    # SCRIVI NUOVO TESTO
     if azione == "Sostituisci" and new_text_str and font_obj:
-        # Colore del testo originale: campiona i pixel dentro il bbox originale
         text_region = img_arr[ymin:ymax, xmin:xmax]
         if text_region.size > 0:
-            # Prendiamo i pixel più scuri/chiari rispetto allo sfondo come colore testo
             bg_arr = np.array(bg_color)
             diffs = np.abs(text_region.astype(int) - bg_arr)
             diff_sum = diffs.sum(axis=2)
@@ -234,21 +221,17 @@ def elabora_testo_dinamico(img_pil, azione="Rimuovi", new_text_str="", font_obj=
                 text_pixels = text_region[diff_sum > 30]
                 text_color = tuple(np.median(text_pixels, axis=0).astype(int))
             else:
-                # Fallback: bianco o nero in base allo sfondo
                 brightness = sum(bg_color) / 3
                 text_color = (255, 255, 255) if brightness < 128 else (0, 0, 0)
         else:
             brightness = sum(bg_color) / 3
             text_color = (255, 255, 255) if brightness < 128 else (0, 0, 0)
             
-        # Calcola dimensioni testo per allineamento a DESTRA
         bbox_txt = font_obj.getbbox(new_text_str)
         text_w = bbox_txt[2] - bbox_txt[0]
         text_h = bbox_txt[3] - bbox_txt[1]
         
-        # Allinea a destra rispetto all'xmax dell'anno originale, applicando offset
         draw_x = xmax - text_w + x_offset
-        # Allinea verticalmente al centro del bbox originale, applicando offset
         draw_y = ymin + ((ymax - ymin) - text_h) // 2 + y_offset
         
         draw.text((draw_x, draw_y), new_text_str, font=font_obj, fill=text_color)
@@ -315,7 +298,7 @@ elif menu == "🎯 Calibrazione":
 elif menu == "⚡ Produzione":
     scelta = st.radio("Formato:", ["Verticali", "Orizzontali", "Quadrati"], horizontal=True)
     
-    with st.expander("🤖 Sostituzione Anno con OCR", expanded=True):
+    with st.expander("🤖 Sostituzione OCR (Leggera)", expanded=True):
         modalita_testo = st.radio(
             "Azione:",
             ("Nessuna modifica", "Solo Rimuovi Anno", "Rimuovi e Sostituisci Anno"),
@@ -332,7 +315,6 @@ elif menu == "⚡ Produzione":
             font_size_input = col_txt2.number_input("Dimensione Font", value=80, min_value=10)
             font_file = col_txt1.file_uploader("Carica font (.ttf/.otf)", type=['ttf', 'otf'])
             
-            st.caption("Aggiustamenti manuali (se l'OCR centra male il testo):")
             x_offset_val = col_txt2.slider("Spostamento Orizzontale", -150, 150, 0)
             y_offset_val = col_txt2.slider("Spostamento Verticale", -150, 150, 0)
             
@@ -414,7 +396,7 @@ elif menu == "⚡ Produzione":
                     progress.progress(count/total)
         st.session_state.zip_ready = True
         st.session_state.zip_data = zip_buf.getvalue()
-        st.success("Batch OCR Completato! Anni rilevati e aggiornati su tutte le grafiche.")
+        st.success("Batch OCR Completato!")
     
     if st.session_state.get('zip_ready'):
         st.download_button("📥 SCARICA ZIP", st.session_state.zip_data, f"Mockups_{scelta}.zip", "application/zip")
