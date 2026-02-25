@@ -1,13 +1,13 @@
 import streamlit as st
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 import os
 import io
 import zipfile
 import json
 
 # --- CONFIGURAZIONE ---
-st.set_page_config(page_title="PhotoBook Mockup Compositor - V5 SMART", layout="wide")
+st.set_page_config(page_title="PhotoBook Mockup - V6 SOSTITUZIONE TESTO", layout="wide")
 
 if 'uploader_key' not in st.session_state:
     st.session_state.uploader_key = 0
@@ -168,52 +168,53 @@ def composite_v3_fixed(tmpl_pil, cover_pil, template_name="", border_offset=None
         tmpl_rgb.putalpha(alpha_mask)
     return tmpl_rgb
 
-# --- NUOVA FUNZIONE: RIMOZIONE TESTO SMART ---
-def applica_censura_smart(img_pil, search_x1, search_x2, search_y1, search_y2, sample_x, sample_y, padding=8):
-    """
-    Cerca la scritta all'interno di una 'Zona di Ricerca' e la copre dinamicamente.
-    """
+# --- FUNZIONE SOSTITUZIONE TESTO SMART ---
+def sostituisci_testo_smart(img_pil, search_x1, search_x2, search_y1, search_y2, sample_x, sample_y, new_text_str="", font_obj=None, padding=8):
     img = img_pil.convert("RGB")
     img_arr = np.array(img)
     h, w, _ = img_arr.shape
     
-    # 1. Trova il colore di sfondo per QUESTA immagine
+    # 1. Colore Sfondo
     bg_color = img_arr[sample_y, sample_x]
     
-    # 2. Converti le percentuali in coordinate pixel per la zona di ricerca
+    # 2. Zona di ricerca
     sx1, sy1 = int((search_x1 * w) / 100), int((search_y1 * h) / 100)
     sx2, sy2 = int((search_x2 * w) / 100), int((search_y2 * h) / 100)
-    
-    # 3. Estrai l'area di ricerca
     search_zone = img_arr[sy1:sy2, sx1:sx2]
     
-    # Se la zona di ricerca è vuota/invalida, ritorna l'immagine originale
-    if search_zone.size == 0:
-        return img
+    if search_zone.size == 0: return img
         
-    # 4. Trova i pixel DIVERSI dal colore di sfondo (tolleranza per artefatti JPEG)
+    # 3. Trova la vecchia scritta (mask)
     diff = np.abs(search_zone.astype(int) - bg_color.astype(int))
-    mask = np.sum(diff, axis=2) > 40  # 40 è la tolleranza. Se il pixel differisce, è "testo"
+    mask = np.sum(diff, axis=2) > 40
     
-    # Se non c'è testo diverso dallo sfondo, ritorna l'immagine intatta
-    if not np.any(mask):
-        return img
+    if not np.any(mask): return img
         
-    # 5. Calcola le coordinate esatte della scritta trovata
+    # --- NUOVO: Campiona il colore del testo originale ---
+    text_pixels = search_zone[mask]
+    # Calcola la media dei colori dei pixel che formano la scritta
+    avg_text_color = np.mean(text_pixels, axis=0).astype(int)
+    text_color_tuple = tuple(avg_text_color)
+
+    # 4. Coordinate vecchia scritta
     rows = np.any(mask, axis=1)
     cols = np.any(mask, axis=0)
     ymin, ymax = np.where(rows)[0][[0, -1]]
     xmin, xmax = np.where(cols)[0][[0, -1]]
     
-    # 6. Riporta le coordinate in scala globale (aggiungendo un po' di margine/padding)
     final_x1 = max(0, sx1 + xmin - padding)
     final_y1 = max(0, sy1 + ymin - padding)
     final_x2 = min(w, sx1 + xmax + padding)
     final_y2 = min(h, sy1 + ymax + padding)
     
-    # 7. Disegna la toppa esatta
     draw = ImageDraw.Draw(img)
+    # 5. Cancella vecchia scritta
     draw.rectangle([final_x1, final_y1, final_x2, final_y2], fill=tuple(bg_color))
+    
+    # --- NUOVO: Inserisci nuova scritta ---
+    if new_text_str and font_obj:
+        # Usa le coordinate in alto a sinistra della vecchia scritta come punto di partenza
+        draw.text((final_x1 + padding, final_y1 + padding), new_text_str, font=font_obj, fill=text_color_tuple)
     
     return img
 
@@ -278,20 +279,38 @@ elif menu == "🎯 Calibrazione":
 elif menu == "⚡ Produzione":
     scelta = st.radio("Formato:", ["Verticali", "Orizzontali", "Quadrati"], horizontal=True)
     
-    # --- OPZIONI CENSURA ---
-    with st.expander("🖌️ Auto-Rimozione Testo (Insegue la scritta)", expanded=False):
-        st.write("Imposta una **Zona di Ricerca** ampia (il riquadro in cui solitamente appare il '2025'). Lo script cercherà la scritta lì dentro e la cancellerà in base alle sue dimensioni reali.")
-        usa_censura = st.checkbox("Attiva auto-rimozione per questi caricamenti")
-        if usa_censura:
+    # --- OPZIONI SOSTITUZIONE TESTO ---
+    with st.expander("🖌️ Sostituzione Testo Smart (Trova '2025' e scrivi altro)", expanded=False):
+        st.write("Imposta la Zona di Ricerca per trovare la vecchia scritta.")
+        usa_sostituzione = st.checkbox("Attiva sostituzione testo")
+        
+        if usa_sostituzione:
+            col_txt1, col_txt2 = st.columns(2)
+            new_text_input = col_txt1.text_input("Nuovo Testo (es. 2026)", value="2026")
+            font_size_input = col_txt2.number_input("Dimensione Font", value=60, min_value=10)
+            font_file = col_txt1.file_uploader("Carica file Font (.ttf o .otf)", type=['ttf', 'otf'])
+            
+            loaded_font = None
+            if font_file:
+                try:
+                    # Carica il font dalla memoria
+                    loaded_font = ImageFont.truetype(io.BytesIO(font_file.read()), font_size_input)
+                    col_txt2.success("Font caricato!")
+                except:
+                    col_txt2.error("Errore caricamento font.")
+            else:
+                col_txt2.warning("Carica un font per risultati migliori.")
+
+            st.divider()
+            st.caption("Zona di Ricerca e Campione Colore Sfondo:")
             col_cen1, col_cen2 = st.columns(2)
-            # Area di ricerca bella ampia per la tua immagine (prende metà destra)
             cens_x1 = col_cen1.slider("Ricerca Inizio X (%)", 0, 100, 50)
             cens_x2 = col_cen1.slider("Ricerca Fine X (%)", 0, 100, 95)
             cens_y1 = col_cen2.slider("Ricerca Inizio Y (%)", 0, 100, 20)
             cens_y2 = col_cen2.slider("Ricerca Fine Y (%)", 0, 100, 45)
             
-            samp_x = st.number_input("Pixel Colore Sfondo X (es: 10)", 0, 10000, 10)
-            samp_y = st.number_input("Pixel Colore Sfondo Y (es: 10)", 0, 10000, 10)
+            samp_x = st.number_input("Pixel Colore Sfondo X", 0, 10000, 10)
+            samp_y = st.number_input("Pixel Colore Sfondo Y", 0, 10000, 10)
 
     st.divider()
 
@@ -299,10 +318,11 @@ elif menu == "⚡ Produzione":
     if up and libreria[scelta]:
         d_img = Image.open(up)
         
-        if usa_censura:
-            d_img = applica_censura_smart(d_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y)
-            st.info("Anteprima: La scritta è stata localizzata e rimossa!")
-            st.image(d_img, caption="Design Pulito", width=250)
+        if usa_sostituzione:
+            # Applica la sostituzione smart
+            d_img = sostituisci_testo_smart(d_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y, new_text_input, loaded_font)
+            st.info("Anteprima: Testo sostituito (se trovato)!")
+            st.image(d_img, caption="Design Modificato", width=250)
 
         cols = st.columns(4)
         for i, (t_name, t_img) in enumerate(libreria[scelta].items()):
@@ -322,9 +342,9 @@ elif menu == "⚡ Produzione":
             for b_file in batch:
                 b_img = Image.open(b_file)
                 
-                # CENSURA DINAMICA NEL BATCH
-                if usa_censura:
-                    b_img = applica_censura_smart(b_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y)
+                # SOSTITUZIONE DINAMICA NEL BATCH
+                if usa_sostituzione:
+                    b_img = sostituisci_testo_smart(b_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y, new_text_input, loaded_font)
 
                 base_name = os.path.splitext(b_file.name)[0]
                 if base_name.lower().endswith('.png'):
@@ -348,7 +368,7 @@ elif menu == "⚡ Produzione":
                     progress.progress(count/total)
         st.session_state.zip_ready = True
         st.session_state.zip_data = zip_buf.getvalue()
-        st.success("Batch Completato! Scritte rimosse automaticamente su tutte le copertine.")
+        st.success("Batch Completato! Testi sostituiti e mockup generati.")
     
     if st.session_state.get('zip_ready'):
         st.download_button("📥 SCARICA ZIP", st.session_state.zip_data, f"Mockups_{scelta}.zip", "application/zip")
