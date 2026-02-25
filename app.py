@@ -5,13 +5,19 @@ import os
 import io
 import zipfile
 import json
-import scipy.ndimage as ndi
+import easyocr
+import re
 
 # --- CONFIGURAZIONE ---
-st.set_page_config(page_title="PhotoBook Mockup - V10 BLINDATA", layout="wide")
+st.set_page_config(page_title="PhotoBook Mockup - V12 OCR", layout="wide")
 
 if 'uploader_key' not in st.session_state:
     st.session_state.uploader_key = 0
+
+# --- READER OCR (Cache per non esplodere la memoria) ---
+@st.cache_resource
+def get_ocr_reader():
+    return easyocr.Reader(['it', 'en'], gpu=False)
 
 # --- ANTI-CACHE ---
 def get_folder_hash(folder_path):
@@ -75,18 +81,12 @@ def find_book_region(tmpl_gray, bg_val):
         if np.all(row[x:x+5] >= 240):
             face_x1 = x
             break
-    return {
-        'book_x1': int(bx1), 'book_x2': int(bx2),
-        'book_y1': int(by1), 'book_y2': int(by2),
-        'face_x1': int(face_x1)
-    }
+    return {'book_x1': int(bx1), 'book_x2': int(bx2), 'book_y1': int(by1), 'book_y2': int(by2), 'face_x1': int(face_x1)}
 
 def composite_v3_fixed(tmpl_pil, cover_pil, template_name="", border_offset=None):
     has_alpha = False
     alpha_mask = None
-    if (tmpl_pil.mode in ('RGBA', 'LA') or
-            (tmpl_pil.mode == 'P' and 'transparency' in tmpl_pil.info) or
-            template_name.lower().endswith('.png')):
+    if (tmpl_pil.mode in ('RGBA', 'LA') or (tmpl_pil.mode == 'P' and 'transparency' in tmpl_pil.info) or template_name.lower().endswith('.png')):
         has_alpha = True
         tmpl_pil = tmpl_pil.convert('RGBA')
         alpha_mask = tmpl_pil.split()[3]
@@ -112,15 +112,11 @@ def composite_v3_fixed(tmpl_pil, cover_pil, template_name="", border_offset=None
         tmpl_l = np.array(tmpl_rgb.convert('L')).astype(np.float64)
         shadows = np.clip(tmpl_l[y1:y1+th, x1:x1+tw] / 246.0, 0, 1.0)
         c_array = np.array(c_res.convert('RGB')).astype(np.float64)
-        for i in range(3):
-            c_array[:,:,i] *= shadows
+        for i in range(3): c_array[:,:,i] *= shadows
         final_face = Image.fromarray(c_array.astype(np.uint8))
-        if c_res.mode == 'RGBA':
-            tmpl_rgb.paste(final_face, (x1, y1), c_res)
-        else:
-            tmpl_rgb.paste(final_face, (x1, y1))
-        if has_alpha:
-            tmpl_rgb.putalpha(alpha_mask)
+        if c_res.mode == 'RGBA': tmpl_rgb.paste(final_face, (x1, y1), c_res)
+        else: tmpl_rgb.paste(final_face, (x1, y1))
+        if has_alpha: tmpl_rgb.putalpha(alpha_mask)
         return tmpl_rgb
 
     tmpl_gray = np.array(tmpl_rgb.convert('L'))
@@ -136,21 +132,13 @@ def composite_v3_fixed(tmpl_pil, cover_pil, template_name="", border_offset=None
     if "base_copertina" in template_name.lower():
         bx1, bx2, by1, by2 = 0, w-1, 0, h-1
         for x in range(w):
-            if np.any(tmpl_gray[:, x] < 250):
-                bx1 = x
-                break
+            if np.any(tmpl_gray[:, x] < 250): bx1 = x; break
         for x in range(w-1, -1, -1):
-            if np.any(tmpl_gray[:, x] < 250):
-                bx2 = x
-                break
+            if np.any(tmpl_gray[:, x] < 250): bx2 = x; break
         for y in range(h):
-            if np.any(tmpl_gray[y, :] < 250):
-                by1 = y
-                break
+            if np.any(tmpl_gray[y, :] < 250): by1 = y; break
         for y in range(h-1, -1, -1):
-            if np.any(tmpl_gray[y, :] < 250):
-                by2 = y
-                break
+            if np.any(tmpl_gray[y, :] < 250): by2 = y; break
 
     bx1, bx2 = max(0, bx1 - 2), min(w - 1, bx2 + 2)
     by1, by2 = max(0, by1 - 2), min(h - 1, by2 + 2)
@@ -158,115 +146,120 @@ def composite_v3_fixed(tmpl_pil, cover_pil, template_name="", border_offset=None
     c_res = cover_pil.resize((tw, th), Image.LANCZOS)
     c_arr = np.array(c_res.convert('RGB')).astype(np.float64)
     sh = np.clip(tmpl_gray[by1:by2+1, bx1:bx2+1] / 246.0, 0, 1.0)
-    for i in range(3):
-        c_arr[:,:,i] *= sh
+    for i in range(3): c_arr[:,:,i] *= sh
     final_face = Image.fromarray(c_arr.astype(np.uint8))
-    if c_res.mode == 'RGBA':
-        tmpl_rgb.paste(final_face, (bx1, by1), c_res)
-    else:
-        tmpl_rgb.paste(final_face, (bx1, by1))
-    if has_alpha:
-        tmpl_rgb.putalpha(alpha_mask)
+    if c_res.mode == 'RGBA': tmpl_rgb.paste(final_face, (bx1, by1), c_res)
+    else: tmpl_rgb.paste(final_face, (bx1, by1))
+    if has_alpha: tmpl_rgb.putalpha(alpha_mask)
     return tmpl_rgb
 
 
-# --- IL CERVELLO BLINDATO (CON LIMITI DI SICUREZZA) ---
-def elabora_testo_dinamico(img_pil, sample_x, sample_y, azione="Rimuovi", new_text_str="", font_obj=None, x_offset=0, y_offset=0, padding=6):
+# --- NUOVA FUNZIONE BLINDATA CON OCR ---
+def elabora_testo_dinamico(img_pil, azione="Rimuovi", new_text_str="", font_obj=None, x_offset=0, y_offset=0):
+    """
+    Trova l'anno (pattern 20XX) tramite OCR e lo sostituisce con new_text_str.
+    Allineamento a destra rispetto al bounding box trovato.
+    Non tocca NULLA se non trova un anno valido.
+    """
+    if azione == "Nessuna modifica":
+        return img_pil
+        
     img = img_pil.convert("RGB")
     img_arr = np.array(img)
-    h, w, _ = img_arr.shape
+    h, w = img_arr.shape[:2]
     
-    bg_color = img_arr[sample_y, sample_x]
+    # Cerchiamo l'anno SOLO nella metà inferiore dell'immagine
+    # per evitare di toccare il titolo grande in alto
+    crop_y_start = h // 3  # dal terzo in giù
+    img_crop = img.crop((0, crop_y_start, w, h))
     
-    diff = np.abs(img_arr.astype(int) - bg_color.astype(int))
-    mask = np.sum(diff, axis=2) > 40
+    reader = get_ocr_reader()
+    results = reader.readtext(np.array(img_crop))
     
-    if not np.any(mask): 
-        return img 
-        
-    # Dilatazione un po' più debole per non accorpare titolo e anno se sono vicini
-    dilated = ndi.binary_dilation(mask, iterations=10)
-    labels, num_features = ndi.label(dilated)
+    # Troviamo tutti i testi che matchano un anno tipo 2020-2029
+    anno_pattern = re.compile(r'\b20[0-9]{2}\b')
+    target = None
     
-    if num_features == 0: 
-        return img
-        
-    best_bbox = None
-    max_score = -1
-    best_blob_mask = None
-    
-    for i in range(1, num_features + 1):
-        blob_mask = (labels == i)
-        rows = np.any(blob_mask, axis=1)
-        cols = np.any(blob_mask, axis=0)
-        
-        ymin, ymax = np.where(rows)[0][[0, -1]]
-        xmin, xmax = np.where(cols)[0][[0, -1]]
-        
-        blob_h = ymax - ymin
-        blob_w = xmax - xmin
-        
-        # --- REGOLE DI SOPRAVVIVENZA (I Freni d'Emergenza) ---
-        # 1. Se il blocco è nella parte alta (sopra la metà dell'immagine), SCARTALO. È il titolo.
-        if ymax < h * 0.4: 
+    for (bbox_points, text, confidence) in results:
+        if confidence < 0.3:
             continue
+        # bbox_points è una lista di 4 punti [[x1,y1],[x2,y1],[x2,y2],[x1,y2]]
+        if anno_pattern.search(text.strip()):
+            # Convertiamo in xmin, ymin, xmax, ymax
+            xs = [p[0] for p in bbox_points]
+            ys = [p[1] for p in bbox_points]
+            xmin, xmax = int(min(xs)), int(max(xs))
+            ymin, ymax = int(min(ys)), int(max(ys))
             
-        # 2. Se il blocco è troppo ALTO (più del 20% dell'altezza dell'immagine), SCARTALO. È una lettera grossa.
-        if blob_h > h * 0.20:
-            continue
+            # Riadattiamo le coordinate al crop (aggiungiamo crop_y_start)
+            ymin += crop_y_start
+            ymax += crop_y_start
             
-        # 3. Se il blocco è largo come tutta la pagina, SCARTALO.
-        if blob_w > w * 0.7:
-            continue
-            
-        # Se sopravvive ai controlli, valutiamo quanto è in basso e a destra
-        score = xmax + (ymax * 2) # Diamo molta importanza al fatto che sia in basso
+            # Prendiamo il più in basso a destra (l'anno sulla copertina)
+            if target is None or (ymax + xmax) > (target[3] + target[2]):
+                target = (xmin, ymin, xmax, ymax)
+                
+    if target is None:
+        # Non ha trovato nessun anno -> non tocca nulla
+        st.info("Nessun anno trovato tramite OCR. Immagine lasciata intatta.")
+        return img_pil
         
-        if score > max_score:
-            max_score = score
-            best_bbox = (xmin, ymin, xmax, ymax)
-            best_blob_mask = blob_mask
-            
-    # --- SEGNALE DI SALVATAGGIO ---
-    # Se non ha trovato NESSUN blocco che rispetta le regole (es. in ROMA), non fa NIENTE.
-    if not best_bbox: 
-        return img
+    xmin, ymin, xmax, ymax = target
+    padding = 4
     
-    xmin, ymin, xmax, ymax = best_bbox
+    # Campiona il colore di sfondo vicino al testo trovato
+    # Prendiamo i pixel appena sopra il bounding box
+    sample_y = max(0, ymin - 5)
+    sample_x = max(0, xmin)
+    bg_color = tuple(img_arr[sample_y, sample_x])
     
-    text_pixels = img_arr[mask & best_blob_mask]
-    if len(text_pixels) > 0:
-        avg_color = np.median(text_pixels, axis=0).astype(int)
-    else:
-        avg_color = np.array([255, 255, 255])
-        
     draw = ImageDraw.Draw(img)
-    erase_x1 = max(0, xmin - padding)
-    erase_y1 = max(0, ymin - padding)
-    erase_x2 = min(w, xmax + padding)
-    erase_y2 = min(h, ymax + padding)
     
-    draw.rectangle([erase_x1, erase_y1, erase_x2, erase_y2], fill=tuple(bg_color))
+    # --- CANCELLA L'ANNO ---
+    draw.rectangle(
+        [xmin - padding, ymin - padding, xmax + padding, ymax + padding],
+        fill=bg_color
+    )
     
+    # --- SCRIVI IL NUOVO TESTO (se richiesto) ---
     if azione == "Sostituisci" and new_text_str and font_obj:
-        bbox = font_obj.getbbox(new_text_str)
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
+        # Colore del testo originale: campiona i pixel dentro il bbox originale
+        text_region = img_arr[ymin:ymax, xmin:xmax]
+        if text_region.size > 0:
+            # Prendiamo i pixel più scuri/chiari rispetto allo sfondo come colore testo
+            bg_arr = np.array(bg_color)
+            diffs = np.abs(text_region.astype(int) - bg_arr)
+            diff_sum = diffs.sum(axis=2)
+            if diff_sum.max() > 30:
+                text_pixels = text_region[diff_sum > 30]
+                text_color = tuple(np.median(text_pixels, axis=0).astype(int))
+            else:
+                # Fallback: bianco o nero in base allo sfondo
+                brightness = sum(bg_color) / 3
+                text_color = (255, 255, 255) if brightness < 128 else (0, 0, 0)
+        else:
+            brightness = sum(bg_color) / 3
+            text_color = (255, 255, 255) if brightness < 128 else (0, 0, 0)
+            
+        # Calcola dimensioni testo per allineamento a DESTRA
+        bbox_txt = font_obj.getbbox(new_text_str)
+        text_w = bbox_txt[2] - bbox_txt[0]
+        text_h = bbox_txt[3] - bbox_txt[1]
         
-        # Allineamento a destra come prima, ma con Offset manuale nel caso serva coprire i buchi
-        draw_x = xmax - text_width + x_offset
-        draw_y = ymax - text_height + y_offset
+        # Allinea a destra rispetto all'xmax dell'anno originale, applicando offset
+        draw_x = xmax - text_w + x_offset
+        # Allinea verticalmente al centro del bbox originale, applicando offset
+        draw_y = ymin + ((ymax - ymin) - text_h) // 2 + y_offset
         
-        draw.text((draw_x, draw_y), new_text_str, font=font_obj, fill=tuple(avg_color))
-    
+        draw.text((draw_x, draw_y), new_text_str, font=font_obj, fill=text_color)
+        
     return img
 
 # --- LIBRERIA ---
 @st.cache_data
 def get_lib(h_val):
     lib = {"Verticali": {}, "Orizzontali": {}, "Quadrati": {}, "Altro": {}}
-    if not os.path.exists("templates"):
-        return lib
+    if not os.path.exists("templates"): return lib
     for f in os.listdir("templates"):
         if f.lower().endswith(('.jpg', '.png', '.jpeg')):
             lib[get_manual_cat(f)][f] = Image.open(os.path.join("templates", f))
@@ -322,42 +315,35 @@ elif menu == "🎯 Calibrazione":
 elif menu == "⚡ Produzione":
     scelta = st.radio("Formato:", ["Verticali", "Orizzontali", "Quadrati"], horizontal=True)
     
-    with st.expander("🤖 Sostituzione Anno BLINDATA", expanded=True):
-        st.write("Versione Sicura: Se non trova un anno piccolo in basso, non tocca nulla (Es. ROMA è salva).")
-        
+    with st.expander("🤖 Sostituzione Anno con OCR", expanded=True):
         modalita_testo = st.radio(
-            "Scegli l'azione da eseguire:",
+            "Azione:",
             ("Nessuna modifica", "Solo Rimuovi Anno", "Rimuovi e Sostituisci Anno"),
-            index=0,
-            horizontal=True
+            index=0, horizontal=True
         )
+        loaded_font = None
+        new_text_input = ""
+        x_offset_val = 0
+        y_offset_val = 0
         
-        if modalita_testo != "Nessuna modifica":
-            col_cen1, col_cen2 = st.columns(2)
-            samp_x = col_cen1.number_input("X Colore Sfondo (Alto a sx)", 0, 1000, 10)
-            samp_y = col_cen2.number_input("Y Colore Sfondo (Alto a sx)", 0, 1000, 10)
-            st.divider()
-
         if modalita_testo == "Rimuovi e Sostituisci Anno":
             col_txt1, col_txt2 = st.columns(2)
-            new_text_input = col_txt1.text_input("Nuovo Anno", value="2026")
+            new_text_input = col_txt1.text_input("Nuovo testo (es. 2026)", value="2026")
             font_size_input = col_txt2.number_input("Dimensione Font", value=80, min_value=10)
-            font_file = col_txt1.file_uploader("Carica file Font (.ttf o .otf)", type=['ttf', 'otf'])
+            font_file = col_txt1.file_uploader("Carica font (.ttf/.otf)", type=['ttf', 'otf'])
             
-            st.caption("Correzioni fini (Usale se c'è un accavallamento come su LONDRA):")
-            x_offset_val = col_txt2.slider("X Offset", -150, 150, 0, help="Sposta il testo a destra o sinistra per coprire i buchi.")
-            y_offset_val = col_txt2.slider("Y Offset", -150, 150, 0, help="Sposta il testo in su o in giù.")
-
-            loaded_font = None
+            st.caption("Aggiustamenti manuali (se l'OCR centra male il testo):")
+            x_offset_val = col_txt2.slider("Spostamento Orizzontale", -150, 150, 0)
+            y_offset_val = col_txt2.slider("Spostamento Verticale", -150, 150, 0)
+            
             if font_file:
                 try:
                     loaded_font = ImageFont.truetype(io.BytesIO(font_file.read()), font_size_input)
-                    col_txt1.success("Font caricato!")
+                    col_txt1.success("✅ Font caricato!")
                 except:
-                    col_txt1.error("Errore font.")
+                    col_txt1.error("Errore nel font.")
             else:
-                col_txt1.warning("Carica un font!")
-            st.divider()
+                col_txt1.warning("Carica un font .ttf per la sostituzione")
 
     up = st.file_uploader("Carica design singolo (Anteprima)", type=['jpg', 'png'], key='preview')
     if up and libreria[scelta]:
@@ -365,18 +351,17 @@ elif menu == "⚡ Produzione":
         
         if modalita_testo != "Nessuna modifica":
             azione_passata = "Sostituisci" if modalita_testo == "Rimuovi e Sostituisci Anno" else "Rimuovi"
-            font_to_pass = loaded_font if modalita_testo == "Rimuovi e Sostituisci Anno" else None
             
-            d_img = elabora_testo_dinamico(
-                d_img, samp_x, samp_y, 
-                azione=azione_passata, 
-                new_text_str=new_text_input if modalita_testo == "Rimuovi e Sostituisci Anno" else "", 
-                font_obj=font_to_pass, 
-                x_offset=x_offset_val if modalita_testo == "Rimuovi e Sostituisci Anno" else 0, 
-                y_offset=y_offset_val if modalita_testo == "Rimuovi e Sostituisci Anno" else 0
-            )
-            st.success("Elaborazione finita. Se l'immagine era senza anno, è rimasta intatta.")
-            st.image(d_img, caption="Design Processato", width=300)
+            with st.spinner('Ricerca testo OCR in corso...'):
+                d_img = elabora_testo_dinamico(
+                    d_img, 
+                    azione=azione_passata, 
+                    new_text_str=new_text_input, 
+                    font_obj=loaded_font,
+                    x_offset=x_offset_val,
+                    y_offset=y_offset_val
+                )
+            st.image(d_img, caption="Design Processato con OCR", width=300)
 
         cols = st.columns(4)
         for i, (t_name, t_img) in enumerate(libreria[scelta].items()):
@@ -398,15 +383,13 @@ elif menu == "⚡ Produzione":
                 
                 if modalita_testo != "Nessuna modifica":
                     azione_passata = "Sostituisci" if modalita_testo == "Rimuovi e Sostituisci Anno" else "Rimuovi"
-                    font_to_pass = loaded_font if modalita_testo == "Rimuovi e Sostituisci Anno" else None
-                    
                     b_img = elabora_testo_dinamico(
-                        b_img, samp_x, samp_y, 
+                        b_img, 
                         azione=azione_passata, 
-                        new_text_str=new_text_input if modalita_testo == "Rimuovi e Sostituisci Anno" else "", 
-                        font_obj=font_to_pass, 
-                        x_offset=x_offset_val if modalita_testo == "Rimuovi e Sostituisci Anno" else 0, 
-                        y_offset=y_offset_val if modalita_testo == "Rimuovi e Sostituisci Anno" else 0
+                        new_text_str=new_text_input, 
+                        font_obj=loaded_font,
+                        x_offset=x_offset_val,
+                        y_offset=y_offset_val
                     )
 
                 base_name = os.path.splitext(b_file.name)[0]
@@ -431,7 +414,7 @@ elif menu == "⚡ Produzione":
                     progress.progress(count/total)
         st.session_state.zip_ready = True
         st.session_state.zip_data = zip_buf.getvalue()
-        st.success("Batch Completato!")
+        st.success("Batch OCR Completato! Anni rilevati e aggiornati su tutte le grafiche.")
     
     if st.session_state.get('zip_ready'):
         st.download_button("📥 SCARICA ZIP", st.session_state.zip_data, f"Mockups_{scelta}.zip", "application/zip")
