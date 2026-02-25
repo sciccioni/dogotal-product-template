@@ -7,7 +7,7 @@ import zipfile
 import json
 
 # --- CONFIGURAZIONE ---
-st.set_page_config(page_title="PhotoBook Mockup - V7 SOSTITUZIONE MIGLIORATA", layout="wide")
+st.set_page_config(page_title="PhotoBook Mockup - V8 SOSTITUZIONE DI PRECISIONE", layout="wide")
 
 if 'uploader_key' not in st.session_state:
     st.session_state.uploader_key = 0
@@ -168,59 +168,33 @@ def composite_v3_fixed(tmpl_pil, cover_pil, template_name="", border_offset=None
         tmpl_rgb.putalpha(alpha_mask)
     return tmpl_rgb
 
-# --- FUNZIONE RIMOZIONE TESTO SMART (SOLO RIMOZIONE) ---
-def applica_censura_smart(img_pil, search_x1, search_x2, search_y1, search_y2, sample_x, sample_y, padding=8):
-    img = img_pil.convert("RGB")
-    img_arr = np.array(img)
-    h, w, _ = img_arr.shape
-    bg_color = img_arr[sample_y, sample_x]
-    sx1, sy1 = int((search_x1 * w) / 100), int((search_y1 * h) / 100)
-    sx2, sy2 = int((search_x2 * w) / 100), int((search_y2 * h) / 100)
-    search_zone = img_arr[sy1:sy2, sx1:sx2]
-    if search_zone.size == 0: return img
-    diff = np.abs(search_zone.astype(int) - bg_color.astype(int))
-    mask = np.sum(diff, axis=2) > 40
-    if not np.any(mask): return img
-    rows = np.any(mask, axis=1)
-    cols = np.any(mask, axis=0)
-    ymin, ymax = np.where(rows)[0][[0, -1]]
-    xmin, xmax = np.where(cols)[0][[0, -1]]
-    final_x1 = max(0, sx1 + xmin - padding)
-    final_y1 = max(0, sy1 + ymin - padding)
-    final_x2 = min(w, sx1 + xmax + padding)
-    final_y2 = min(h, sy1 + ymax + padding)
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([final_x1, final_y1, final_x2, final_y2], fill=tuple(bg_color))
-    return img
-
-# --- FUNZIONE SOSTITUZIONE TESTO SMART (CON OFFSET) ---
-def sostituisci_testo_smart(img_pil, search_x1, search_x2, search_y1, search_y2, sample_x, sample_y, new_text_str="", font_obj=None, padding=8, x_offset=0, y_offset=0):
+# --- FUNZIONI TESTO SMART ---
+def elabora_testo_smart(img_pil, search_x1, search_x2, search_y1, search_y2, sample_x, sample_y, azione="Rimuovi", new_text_str="", font_obj=None, padding=8, x_offset=0, y_offset=0, debug_mode=False):
     img = img_pil.convert("RGB")
     img_arr = np.array(img)
     h, w, _ = img_arr.shape
     
-    # 1. Colore Sfondo
     bg_color = img_arr[sample_y, sample_x]
     
-    # 2. Zona di ricerca
     sx1, sy1 = int((search_x1 * w) / 100), int((search_y1 * h) / 100)
     sx2, sy2 = int((search_x2 * w) / 100), int((search_y2 * h) / 100)
     search_zone = img_arr[sy1:sy2, sx1:sx2]
     
     if search_zone.size == 0: return img
         
-    # 3. Trova la vecchia scritta (mask)
     diff = np.abs(search_zone.astype(int) - bg_color.astype(int))
     mask = np.sum(diff, axis=2) > 40
     
-    if not np.any(mask): return img
+    if not np.any(mask): 
+        if debug_mode:
+            draw = ImageDraw.Draw(img)
+            draw.rectangle([sx1, sy1, sx2, sy2], outline="blue", width=3)
+        return img
         
-    # 4. Campiona il colore del testo originale
     text_pixels = search_zone[mask]
     avg_text_color = np.mean(text_pixels, axis=0).astype(int)
     text_color_tuple = tuple(avg_text_color)
 
-    # 5. Coordinate vecchia scritta
     rows = np.any(mask, axis=1)
     cols = np.any(mask, axis=0)
     ymin, ymax = np.where(rows)[0][[0, -1]]
@@ -232,12 +206,21 @@ def sostituisci_testo_smart(img_pil, search_x1, search_x2, search_y1, search_y2,
     final_y2 = min(h, sy1 + ymax + padding)
     
     draw = ImageDraw.Draw(img)
-    # 6. Cancella vecchia scritta
+
+    if debug_mode:
+        # Disegna Riquadro Blu (Area di Ricerca)
+        draw.rectangle([sx1, sy1, sx2, sy2], outline="blue", width=3)
+        # Disegna Riquadro Rosso (Cosa viene considerato "Testo da rimuovere")
+        draw.rectangle([final_x1, final_y1, final_x2, final_y2], outline="red", width=4)
+        # Segna il punto di campionamento
+        r=5
+        draw.ellipse([sample_x-r, sample_y-r, sample_x+r, sample_y+r], fill="green", outline="white")
+        return img
+
+    # Se non siamo in debug, procediamo con la cancellazione/sostituzione vera e propria
     draw.rectangle([final_x1, final_y1, final_x2, final_y2], fill=tuple(bg_color))
     
-    # 7. Inserisci nuova scritta con OFFSET
-    if new_text_str and font_obj:
-        # Usa le coordinate originali + offset e padding
+    if azione == "Sostituisci" and new_text_str and font_obj:
         draw.text((final_x1 + padding + x_offset, final_y1 + padding + y_offset), new_text_str, font=font_obj, fill=text_color_tuple)
     
     return img
@@ -303,38 +286,37 @@ elif menu == "🎯 Calibrazione":
 elif menu == "⚡ Produzione":
     scelta = st.radio("Formato:", ["Verticali", "Orizzontali", "Quadrati"], horizontal=True)
     
-    # --- OPZIONI MODIFICA TESTO (Mutuamente Esclusive) ---
-    with st.expander("🖌️ Modifica Testo Smart (Rimuovi o Sostituisci)", expanded=False):
-        # Selezione della modalità
+    with st.expander("🖌️ Modifica Testo Smart", expanded=True):
         modalita_testo = st.radio(
-            "Scegli l'azione da eseguire sul testo (es. '2025'):",
+            "Scegli l'azione da eseguire:",
             ("Nessuna modifica", "Rimuovi Solo", "Rimuovi e Sostituisci"),
             index=0,
             horizontal=True
         )
         
-        # Parametri comuni (Zona di ricerca e Campione Colore)
         if modalita_testo != "Nessuna modifica":
-            st.caption("Zona di Ricerca e Campione Colore Sfondo:")
+            st.info("⚠️ **IMPORTANTE:** Usa la modalità 'Mostra Mirino' qui sotto per assicurarti che il riquadro rosso tagli SOLO i numeri e non tocchi le lettere del titolo, altrimenti cancellerà anche quelle e scriverà storto!")
+            mostra_debug = st.toggle("🔍 MOSTRA MIRINO DI PRECISIONE (Riquadro Rosso = Taglio)", value=True)
+            
+            st.caption("Coordinate Zona di Ricerca (Riquadro Blu):")
             col_cen1, col_cen2 = st.columns(2)
             cens_x1 = col_cen1.slider("Ricerca Inizio X (%)", 0, 100, 50)
             cens_x2 = col_cen1.slider("Ricerca Fine X (%)", 0, 100, 95)
-            cens_y1 = col_cen2.slider("Ricerca Inizio Y (%)", 0, 100, 20)
-            cens_y2 = col_cen2.slider("Ricerca Fine Y (%)", 0, 100, 45)
-            samp_x = st.number_input("Pixel Colore Sfondo X", 0, 10000, 10)
-            samp_y = st.number_input("Pixel Colore Sfondo Y", 0, 10000, 10)
+            cens_y1 = col_cen2.slider("Ricerca Inizio Y (%)", 0, 100, 25) # Alzato un po' il default per evitare il titolo
+            cens_y2 = col_cen2.slider("Ricerca Fine Y (%)", 0, 100, 50)
+            samp_x = st.number_input("Pixel Sfondo X (Pallino Verde)", 0, 10000, 10)
+            samp_y = st.number_input("Pixel Sfondo Y (Pallino Verde)", 0, 10000, 10)
             st.divider()
 
-        # Parametri specifici per "Rimuovi e Sostituisci"
         if modalita_testo == "Rimuovi e Sostituisci":
             col_txt1, col_txt2 = st.columns(2)
             new_text_input = col_txt1.text_input("Nuovo Testo (es. 2026)", value="2026")
-            font_size_input = col_txt2.number_input("Dimensione Font", value=60, min_value=10)
+            font_size_input = col_txt2.number_input("Dimensione Font", value=80, min_value=10)
             font_file = col_txt1.file_uploader("Carica file Font (.ttf o .otf)", type=['ttf', 'otf'])
             
-            # --- NUOVO: Slider per l'offset della posizione ---
-            x_offset_val = col_txt2.slider("Sposta Orizzontalmente (X Offset)", -200, 200, 0, help="Valori positivi spostano a destra, negativi a sinistra.")
-            y_offset_val = col_txt2.slider("Sposta Verticalmente (Y Offset)", -200, 200, 0, help="Valori positivi spostano in basso, negativi in alto.")
+            st.caption("Aggiustamento Posizione Nuova Scritta:")
+            x_offset_val = col_txt2.slider("Sposta a Destra/Sinistra (X Offset)", -300, 300, 0)
+            y_offset_val = col_txt2.slider("Sposta Giù/Su (Y Offset)", -300, 300, 0)
 
             loaded_font = None
             if font_file:
@@ -347,69 +329,89 @@ elif menu == "⚡ Produzione":
                 col_txt1.warning("Carica un font per la sostituzione.")
             st.divider()
 
-    st.divider()
-
     up = st.file_uploader("Carica design singolo (Anteprima)", type=['jpg', 'png'], key='preview')
     if up and libreria[scelta]:
         d_img = Image.open(up)
         
-        # Applica la modifica scelta all'anteprima
-        if modalita_testo == "Rimuovi Solo":
-            d_img = applica_censura_smart(d_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y)
-            st.info("Anteprima: Testo rimosso (se trovato)!")
-            st.image(d_img, caption="Design Rimosso", width=250)
-        elif modalita_testo == "Rimuovi e Sostituisci":
-            d_img = sostituisci_testo_smart(d_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y, new_text_input, loaded_font, x_offset=x_offset_val, y_offset=y_offset_val)
-            st.info("Anteprima: Testo sostituito e riposizionato (se trovato)!")
-            st.image(d_img, caption="Design Sostituito", width=250)
+        if modalita_testo != "Nessuna modifica":
+            azione_passata = "Sostituisci" if modalita_testo == "Rimuovi e Sostituisci" else "Rimuovi"
+            font_to_pass = loaded_font if modalita_testo == "Rimuovi e Sostituisci" else None
+            
+            d_img = elabora_testo_smart(
+                d_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y, 
+                azione=azione_passata, new_text_str=new_text_input if modalita_testo == "Rimuovi e Sostituisci" else "", 
+                font_obj=font_to_pass, x_offset=x_offset_val if modalita_testo == "Rimuovi e Sostituisci" else 0, 
+                y_offset=y_offset_val if modalita_testo == "Rimuovi e Sostituisci" else 0,
+                debug_mode=mostra_debug
+            )
+            
+            if mostra_debug:
+                st.warning("🛑 Sei in modalità MIRINO. Il mockup sotto NON verrà generato finché non spegni il mirino. Regola gli slider finché il quadrato ROSSO avvolge SOLO l'anno, non il titolo!")
+                st.image(d_img, caption="Anteprima Mirino - Regola gli slider", width=500)
+            else:
+                st.success("Anteprima: Testo modificato!")
+                st.image(d_img, caption="Design Finale", width=300)
 
-        cols = st.columns(4)
-        for i, (t_name, t_img) in enumerate(libreria[scelta].items()):
-            with cols[i%4]:
-                res = composite_v3_fixed(t_img, d_img, t_name)
-                st.image(res, caption=t_name, use_column_width=True)
+        # Non generare i mockup del libro se siamo in modalità debug, sprechiamo solo risorse visive
+        mostra_mockups = not (modalita_testo != "Nessuna modifica" and mostra_debug)
+        
+        if mostra_mockups:
+            cols = st.columns(4)
+            for i, (t_name, t_img) in enumerate(libreria[scelta].items()):
+                with cols[i%4]:
+                    res = composite_v3_fixed(t_img, d_img, t_name)
+                    st.image(res, caption=t_name, use_column_width=True)
     
     st.divider()
     
     batch = st.file_uploader("Batch Produzione (Zippa tutto)", accept_multiple_files=True)
     if st.button("🚀 GENERA TUTTI (BATCH)") and batch and libreria[scelta]:
-        zip_buf = io.BytesIO()
-        with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED) as zf:
-            progress = st.progress(0)
-            total = len(batch) * len(libreria[scelta])
-            count = 0
-            for b_file in batch:
-                b_img = Image.open(b_file)
-                
-                # Applica la modifica scelta al batch
-                if modalita_testo == "Rimuovi Solo":
-                    b_img = applica_censura_smart(b_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y)
-                elif modalita_testo == "Rimuovi e Sostituisci":
-                    b_img = sostituisci_testo_smart(b_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y, new_text_input, loaded_font, x_offset=x_offset_val, y_offset=y_offset_val)
+        if modalita_testo != "Nessuna modifica" and mostra_debug:
+            st.error("Spegnere l'interruttore 'MOSTRA MIRINO DI PRECISIONE' prima di lanciare il Batch!")
+        else:
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED) as zf:
+                progress = st.progress(0)
+                total = len(batch) * len(libreria[scelta])
+                count = 0
+                for b_file in batch:
+                    b_img = Image.open(b_file)
+                    
+                    if modalita_testo != "Nessuna modifica":
+                        azione_passata = "Sostituisci" if modalita_testo == "Rimuovi e Sostituisci" else "Rimuovi"
+                        font_to_pass = loaded_font if modalita_testo == "Rimuovi e Sostituisci" else None
+                        
+                        b_img = elabora_testo_smart(
+                            b_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y, 
+                            azione=azione_passata, new_text_str=new_text_input if modalita_testo == "Rimuovi e Sostituisci" else "", 
+                            font_obj=font_to_pass, x_offset=x_offset_val if modalita_testo == "Rimuovi e Sostituisci" else 0, 
+                            y_offset=y_offset_val if modalita_testo == "Rimuovi e Sostituisci" else 0,
+                            debug_mode=False
+                        )
 
-                base_name = os.path.splitext(b_file.name)[0]
-                if base_name.lower().endswith('.png'):
-                    base_name = base_name[:-4]
-                
-                for t_name, t_img in libreria[scelta].items():
-                    res = composite_v3_fixed(t_img, b_img, t_name)
-                    is_tmpl_png = t_name.lower().endswith('.png') or res.mode == 'RGBA'
-                    save_fmt = 'PNG' if is_tmpl_png else 'JPEG'
-                    save_ext = '.png' if is_tmpl_png else '.jpg'
-                    buf = io.BytesIO()
-                    if save_fmt == 'PNG':
-                        res.save(buf, format='PNG')
-                    else:
-                        res.save(buf, format='JPEG', quality=95)
-                    t_clean = os.path.splitext(t_name)[0]
-                    if t_clean.lower().endswith('.png'):
-                        t_clean = t_clean[:-4]
-                    zf.writestr(f"{base_name}/{t_clean}{save_ext}", buf.getvalue())
-                    count += 1
-                    progress.progress(count/total)
-        st.session_state.zip_ready = True
-        st.session_state.zip_data = zip_buf.getvalue()
-        st.success("Batch Completato! Modifiche al testo applicate.")
-    
-    if st.session_state.get('zip_ready'):
-        st.download_button("📥 SCARICA ZIP", st.session_state.zip_data, f"Mockups_{scelta}.zip", "application/zip")
+                    base_name = os.path.splitext(b_file.name)[0]
+                    if base_name.lower().endswith('.png'):
+                        base_name = base_name[:-4]
+                    
+                    for t_name, t_img in libreria[scelta].items():
+                        res = composite_v3_fixed(t_img, b_img, t_name)
+                        is_tmpl_png = t_name.lower().endswith('.png') or res.mode == 'RGBA'
+                        save_fmt = 'PNG' if is_tmpl_png else 'JPEG'
+                        save_ext = '.png' if is_tmpl_png else '.jpg'
+                        buf = io.BytesIO()
+                        if save_fmt == 'PNG':
+                            res.save(buf, format='PNG')
+                        else:
+                            res.save(buf, format='JPEG', quality=95)
+                        t_clean = os.path.splitext(t_name)[0]
+                        if t_clean.lower().endswith('.png'):
+                            t_clean = t_clean[:-4]
+                        zf.writestr(f"{base_name}/{t_clean}{save_ext}", buf.getvalue())
+                        count += 1
+                        progress.progress(count/total)
+            st.session_state.zip_ready = True
+            st.session_state.zip_data = zip_buf.getvalue()
+            st.success("Batch Completato! Modifiche applicate a tutti i file.")
+        
+        if st.session_state.get('zip_ready'):
+            st.download_button("📥 SCARICA ZIP", st.session_state.zip_data, f"Mockups_{scelta}.zip", "application/zip")
