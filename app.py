@@ -204,7 +204,7 @@ def elabora_testo_dinamico(img_pil, azione="Rimuovi",
 
     # Cancella con padding generoso
     draw = ImageDraw.Draw(img)
-    draw.rectangle([x1-15, y1-10, x2+15, y2+10], fill=bg_color)
+    draw.rectangle([x1-25, y1-15, x2+25, y2+15], fill=bg_color)
 
     # Riscrivi
     if azione == "Sostituisci" and new_text_str and font_file_bytes:
@@ -330,42 +330,56 @@ elif menu == "⚡ Produzione":
         )
 
     up = st.file_uploader("Carica design singolo (Anteprima)", type=['jpg','png'], key='preview')
-    if up and libreria[scelta]:
+    if up:
         d_img = Image.open(up)
         d_img = processa_img(d_img)
         st.image(d_img, caption="Design Processato", width=300)
-        cols = st.columns(4)
-        for i,(t_name,t_img) in enumerate(libreria[scelta].items()):
-            with cols[i%4]:
-                res = composite_v3_fixed(t_img, d_img, t_name)
-                st.image(res, caption=t_name, use_column_width=True)
+
+        if libreria[scelta]:
+            template_scelto = st.selectbox("Template per anteprima mockup:", ["-- nessuno --"] + list(libreria[scelta].keys()))
+            if template_scelto != "-- nessuno --":
+                t_img = libreria[scelta][template_scelto]
+                res = composite_v3_fixed(t_img, d_img, template_scelto)
+                st.image(res, caption=template_scelto, width=400)
+                buf_dl = io.BytesIO()
+                ext = 'png' if template_scelto.lower().endswith('.png') else 'jpg'
+                if ext == 'png': res.save(buf_dl, format='PNG')
+                else: res.save(buf_dl, format='JPEG', quality=95)
+                st.download_button("📥 Scarica questo mockup", buf_dl.getvalue(),
+                                   f"{os.path.splitext(up.name)[0]}_{os.path.splitext(template_scelto)[0]}.{ext}")
 
     st.divider()
 
-    batch = st.file_uploader("Batch Produzione", accept_multiple_files=True)
-    if st.button("🚀 GENERA TUTTI (BATCH)") and batch and libreria[scelta]:
+    st.subheader("🚀 Batch Produzione")
+    batch = st.file_uploader("Carica tutti i design", accept_multiple_files=True, key='batch')
+
+    if libreria[scelta]:
+        template_batch = st.selectbox("Template per batch:", list(libreria[scelta].keys()), key='batch_tmpl')
+    else:
+        template_batch = None
+        st.warning("Nessun template disponibile per questa categoria.")
+
+    if st.button("🚀 GENERA BATCH") and batch and template_batch:
+        t_img = libreria[scelta][template_batch]
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf,"a",zipfile.ZIP_DEFLATED) as zf:
             progress = st.progress(0)
-            total = len(batch)*len(libreria[scelta])
-            count = 0
-            for b_file in batch:
+            for idx, b_file in enumerate(batch):
                 b_img = Image.open(b_file)
                 b_img = processa_img(b_img)
                 base_name = os.path.splitext(b_file.name)[0]
-                for t_name,t_img in libreria[scelta].items():
-                    res = composite_v3_fixed(t_img, b_img, t_name)
-                    is_png = t_name.lower().endswith('.png') or res.mode=='RGBA'
-                    buf2 = io.BytesIO()
-                    if is_png: res.save(buf2,format='PNG')
-                    else: res.save(buf2,format='JPEG',quality=95)
-                    ext = '.png' if is_png else '.jpg'
-                    zf.writestr(f"{base_name}/{os.path.splitext(t_name)[0]}{ext}", buf2.getvalue())
-                    count += 1
-                    progress.progress(count/total)
+                res = composite_v3_fixed(t_img, b_img, template_batch)
+                is_png = template_batch.lower().endswith('.png') or res.mode=='RGBA'
+                buf2 = io.BytesIO()
+                if is_png: res.save(buf2, format='PNG')
+                else: res.save(buf2, format='JPEG', quality=95)
+                ext = '.png' if is_png else '.jpg'
+                t_clean = os.path.splitext(template_batch)[0]
+                zf.writestr(f"{base_name}_{t_clean}{ext}", buf2.getvalue())
+                progress.progress((idx+1)/len(batch))
         st.session_state.zip_ready = True
         st.session_state.zip_data = zip_buf.getvalue()
-        st.success("✅ Batch Completato!")
+        st.success(f"✅ {len(batch)} mockup generati!")
 
     if st.session_state.get('zip_ready'):
         st.download_button("📥 SCARICA ZIP", st.session_state.zip_data,
