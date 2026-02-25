@@ -216,8 +216,8 @@ def trova_anno_con_gpt(img_pil, openai_api_key):
 def raffina_bbox_pixel(img_arr, gpt_x1, gpt_y1, gpt_x2, gpt_y2, bg_color):
     h, w = img_arr.shape[:2]
     bg_arr = np.array(bg_color)
-    margin_x = max(20, (gpt_x2 - gpt_x1) // 5)
-    margin_y = max(20, (gpt_y2 - gpt_y1) // 5)
+    margin_x = max(30, (gpt_x2 - gpt_x1) // 3)
+    margin_y = max(30, (gpt_y2 - gpt_y1) // 3)
     sx1 = max(0, gpt_x1 - margin_x)
     sy1 = max(0, gpt_y1 - margin_y)
     sx2 = min(w, gpt_x2 + margin_x)
@@ -229,12 +229,14 @@ def raffina_bbox_pixel(img_arr, gpt_x1, gpt_y1, gpt_x2, gpt_y2, bg_color):
         return gpt_x1, gpt_y1, gpt_x2, gpt_y2
     rows = np.any(text_mask, axis=1)
     cols = np.any(text_mask, axis=0)
-    return (
-        sx1 + int(np.where(cols)[0][0]),
-        sy1 + int(np.where(rows)[0][0]),
-        sx1 + int(np.where(cols)[0][-1]),
-        sy1 + int(np.where(rows)[0][-1]),
-    )
+    real_x1 = sx1 + int(np.where(cols)[0][0])
+    real_y1 = sy1 + int(np.where(rows)[0][0])
+    real_x2 = sx1 + int(np.where(cols)[0][-1])
+    real_y2 = sy1 + int(np.where(rows)[0][-1])
+    # Clamp ai bordi immagine
+    real_x2 = min(real_x2, w - 5)
+    real_y2 = min(real_y2, h - 5)
+    return real_x1, real_y1, real_x2, real_y2
 
 # --- FUNZIONE PRINCIPALE SOSTITUZIONE ANNO ---
 def elabora_testo_dinamico(img_pil, openai_api_key, azione="Rimuovi",
@@ -295,18 +297,20 @@ def elabora_testo_dinamico(img_pil, openai_api_key, azione="Rimuovi",
         bbox_h = y2 - y1
         try:
             if auto_scale:
-                fs = font_size
-                while fs > 8:
+                # AUTO: scala fino a matchare l'altezza del testo originale
+                fs = 8
+                while fs < 500:
                     font = ImageFont.truetype(io.BytesIO(font_file_bytes), fs)
                     tb = font.getbbox(new_text_str)
-                    tw, th = tb[2] - tb[0], tb[3] - tb[1]
-                    if tw <= bbox_w and th <= bbox_h * 0.9:
+                    if (tb[3] - tb[1]) >= bbox_h * 0.85:
                         break
-                    fs -= 2
+                    fs += 1
             else:
-                font = ImageFont.truetype(io.BytesIO(font_file_bytes), font_size)
-                tb = font.getbbox(new_text_str)
-                tw, th = tb[2] - tb[0], tb[3] - tb[1]
+                # MANUALE: usa esattamente il font size scelto dall'utente
+                fs = font_size
+            font = ImageFont.truetype(io.BytesIO(font_file_bytes), fs)
+            tb = font.getbbox(new_text_str)
+            tw, th = tb[2] - tb[0], tb[3] - tb[1]
         except Exception as e:
             st.warning(f"Errore font: {e}")
             return img
@@ -413,8 +417,8 @@ elif menu == "⚡ Produzione":
             else:
                 col2.warning("Carica un font .ttf")
 
-            font_size_input = col3.number_input("Dimensione font (px)", value=100, min_value=8, max_value=500)
-            auto_scale_input = col3.checkbox("Scala automatico se non entra", value=False)
+            font_size_input = col3.number_input("Dimensione font manuale (px)", value=55, min_value=8, max_value=500)
+            auto_scale_input = col3.checkbox("🔁 Auto: matcha altezza testo originale", value=True)
 
             usa_colore_auto = col1.checkbox("🎨 Colore automatico (rileva dall'originale)", value=True)
             if not usa_colore_auto:
