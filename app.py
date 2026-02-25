@@ -1,7 +1,8 @@
 import streamlit as st
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-import os, io, zipfile, json, base64, urllib.request, re
+import os, io, zipfile, json, re
+import pytesseract
 
 st.set_page_config(page_title="PhotoBook Mockup", layout="wide")
 
@@ -99,127 +100,116 @@ def composite_v3_fixed(tmpl_pil, cover_pil, template_name="", border_offset=None
     return tmpl_rgb
 
 # ---------------------------------------------------------------
-# ANNO ENGINE - GPT con immagine originale, percentuali verificate
+# ANNO ENGINE - Tesseract con isolamento colore
 # ---------------------------------------------------------------
 
-def trova_anno_gpt(img_pil, openai_api_key):
+anno_pattern = re.compile(r'^20\d{2}$')
+
+def trova_anno_tesseract(img_pil):
     """
-    Manda immagine originale a GPT-4o mini.
-    Chiede SOLO le percentuali dell'anno numerico.
-    Poi VERIFICA con scansione pixel che il bbox contenga pixel diversi dallo sfondo.
+    Trova l'anno (20XX) isolando ogni colore dominante nella zona alta
+    dell'immagine e passandolo a Tesseract.
+    Ritorna (x1, y1, x2, y2, text_color) oppure None.
     """
-    orig_w, orig_h = img_pil.size
+    img_arr = np.array(img_pil.convert('RGB'))
+    h, w = img_arr.shape[:2]
 
-    # Ridimensiona mantenendo le proporzioni originali, max 768px lato lungo
-    max_side = 768
-    scale = min(max_side/orig_w, max_side/orig_h, 1.0)
-    new_w, new_h = int(orig_w*scale), int(orig_h*scale)
-    img_send = img_pil.convert("RGB").resize((new_w, new_h), Image.LANCZOS)
+    # Cerca solo nel top 55% — l'anno è sempre in alto
+    zona_h = int(h * 0.55)
+    zona = img_arr[:zona_h, :, :]
 
-    buf = io.BytesIO()
-    img_send.save(buf, format="JPEG", quality=90)
-    b64 = base64.b64encode(buf.getvalue()).decode()
+    # Colore sfondo: angolo top-left
+    bg_color = np.median(img_arr[5:25, 5:25].reshape(-1, 3), axis=0)
 
-    prompt = (
-        f"Immagine copertina fotolibro, dimensioni {new_w}x{new_h}px.\n"
-        "Trova SOLO il testo dell'anno (numero 4 cifre tipo 2024/2025/2026).\n"
-        "NON il titolo/città in alto - SOLO l'anno numerico più piccolo.\n"
-        f"Rispondi SOLO con JSON usando coordinate pixel in questa immagine {new_w}x{new_h}:\n"
-        '{"trovato":true,"x1":300,"y1":200,"x2":450,"y2":260}\n'
-        'Se non trovi anno: {"trovato":false}'
-    )
+    # Trova colori dominanti non-sfondo nella zona
+    pixels = zona.reshape(-1, 3).astype(int)
+    diff_bg = np.abs(pixels - bg_color).sum(axis=1)
+    text_pixels = pixels[diff_bg > 80]
 
-    payload = json.dumps({
-        "model": "gpt-4o", "max_tokens": 80,
-        "messages": [{"role":"user","content":[
-            {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}","detail":"high"}},
-            {"type":"text","text":prompt}
-        ]}]
-    }).encode()
-
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions", data=payload,
-        headers={"Content-Type":"application/json","Authorization":f"Bearer {openai_api_key}"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
-            raw = re.sub(r"```json|```","",data["choices"][0]["message"]["content"].strip()).strip()
-            r = json.loads(raw)
-            if not r.get("trovato"): return None
-            # Scala da img_send a originale
-            sx, sy = orig_w/new_w, orig_h/new_h
-            x1 = max(0, int(r["x1"]*sx))
-            y1 = max(0, int(r["y1"]*sy))
-            x2 = min(orig_w-1, int(r["x2"]*sx))
-            y2 = min(orig_h-1, int(r["y2"]*sy))
-            # Sanity: bbox non troppo grande (max 60% larghezza, max 25% altezza)
-            if (x2-x1) > orig_w*0.85 or (y2-y1) > orig_h*0.35:
-                return None
-            # Sanity: deve essere nel terzo superiore (anno sta sempre in alto)
-            if y1 > orig_h*0.6:
-                return None
-            return x1, y1, x2, y2
-    except:
+    if len(text_pixels) == 0:
         return None
 
+    rounded = (text_pixels // 30 * 30)
+    unique, counts = np.unique(rounded, axis=0, return_counts=True)
+    top_colors = unique[np.argsort(-counts)[:8]]  # top 8 colori
 
-def elabora_testo_dinamico(img_pil, openai_api_key, azione="Rimuovi",
+    best = None
+    best_conf = -1
+
+    for color in top_colors:
+        # Maschera: pixel di questo colore → neri, resto → bianchi
+        color_diff = np.abs(img_arr[:zona_h].astype(int) - color).sum(axis=2)
+        mask = np.where(color_diff < 55, 0, 255).astype(np.uint8)
+        img_mask = Image.fromarray(mask)
+        # Scala x3 per migliorare OCR
+        scale = 3
+        img_big = img_mask.resize((w*scale, zona_h*scale), Image.LANCZOS)
+
+        try:
+            data = pytesseract.image_to_data(
+                img_big,
+                output_type=pytesseract.Output.DICT,
+                config='--psm 11 -c tessedit_char_whitelist=0123456789'
+            )
+            for i, text in enumerate(data['text']):
+                t = text.strip()
+                conf = int(data['conf'][i])
+                if anno_pattern.match(t) and conf > 50:
+                    x1 = data['left'][i] // scale
+                    y1 = data['top'][i] // scale
+                    bw = data['width'][i] // scale
+                    bh = data['height'][i] // scale
+                    if conf > best_conf:
+                        best_conf = conf
+                        best = (x1, y1, x1+bw, y1+bh, tuple(int(v) for v in color))
+        except:
+            pass
+
+    return best
+
+
+def elabora_testo_dinamico(img_pil, azione="Rimuovi",
                             new_text_str="", font_file_bytes=None,
                             font_size=None, text_color_override=None):
     if azione == "Nessuna modifica":
         return img_pil
-    if not openai_api_key:
-        st.warning("⚠️ Inserisci la OpenAI API Key")
-        return img_pil
 
-    coords = trova_anno_gpt(img_pil, openai_api_key)
-    if coords is None:
+    result = trova_anno_tesseract(img_pil)
+    if result is None:
         st.info("ℹ️ Anno non trovato — immagine lasciata intatta.")
         return img_pil
 
-    x1, y1, x2, y2 = coords
+    x1, y1, x2, y2, auto_text_color = result
     img = img_pil.convert("RGB")
     img_arr = np.array(img)
     h, w = img_arr.shape[:2]
+
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w-1, x2), min(h-1, y2)
     bbox_h = y2 - y1
     bbox_w = x2 - x1
 
-    # Colore sfondo: mediana dei pixel INTORNO al bbox (fascia di 30px)
+    # Colore sfondo: pixels intorno al bbox
     pad = 30
-    ys1,ys2 = max(0,y1-pad), min(h,y2+pad)
-    xs1,xs2 = max(0,x1-pad), min(w,x2+pad)
+    ys1, ys2 = max(0, y1-pad), min(h, y2+pad)
+    xs1, xs2 = max(0, x1-pad), min(w, x2+pad)
     surround = img_arr[ys1:ys2, xs1:xs2].copy()
-    # Azzera la zona interna (il testo stesso)
-    inner_y1 = y1-ys1
-    inner_y2 = y2-ys1
-    inner_x1 = x1-xs1
-    inner_x2 = x2-xs1
     mask = np.ones(surround.shape[:2], dtype=bool)
-    mask[inner_y1:inner_y2, inner_x1:inner_x2] = False
+    mask[y1-ys1:y2-ys1, x1-xs1:x2-xs1] = False
     bg_pixels = surround[mask]
     bg_color = tuple(int(v) for v in np.median(bg_pixels, axis=0))
 
-    # Colore testo: pixel nel bbox diversi dallo sfondo
-    region = img_arr[y1:y2, x1:x2].reshape(-1,3)
-    diffs = np.abs(region.astype(int) - np.array(bg_color)).sum(axis=1)
-    text_pix = region[diffs > 50]
-    if text_color_override:
-        text_color = text_color_override
-    elif len(text_pix) > 0:
-        text_color = tuple(int(v) for v in np.median(text_pix, axis=0))
-    else:
-        text_color = (255,255,255) if sum(bg_color)/3 < 128 else (0,0,0)
+    # Colore testo
+    text_color = text_color_override if text_color_override else auto_text_color
 
     # Cancella con padding generoso
     draw = ImageDraw.Draw(img)
-    draw.rectangle([x1-30, y1-15, x2+30, y2+15], fill=bg_color)
+    draw.rectangle([x1-15, y1-10, x2+15, y2+10], fill=bg_color)
 
     # Riscrivi
     if azione == "Sostituisci" and new_text_str and font_file_bytes:
         try:
             if font_size is None:
-                # Auto: matcha altezza originale
                 fs = 8
                 while fs < 500:
                     font = ImageFont.truetype(io.BytesIO(font_file_bytes), fs)
@@ -232,7 +222,7 @@ def elabora_testo_dinamico(img_pil, openai_api_key, azione="Rimuovi",
             tb = font.getbbox(new_text_str)
             tw, th = tb[2]-tb[0], tb[3]-tb[1]
             draw_x = x2 - tw        # allineato a DESTRA
-            draw_y = y1 + (bbox_h-th)//2
+            draw_y = y1 + (bbox_h - th) // 2
             draw.text((draw_x, draw_y), new_text_str, font=font, fill=text_color)
         except Exception as e:
             st.warning(f"Errore font: {e}")
@@ -295,7 +285,6 @@ elif menu == "⚡ Produzione":
     scelta = st.radio("Formato:", ["Verticali","Orizzontali","Quadrati"], horizontal=True)
 
     with st.expander("🤖 Sostituzione Anno", expanded=True):
-        openai_key = st.text_input("🔑 OpenAI API Key", type="password")
         modalita_testo = st.radio(
             "Azione:",
             ("Nessuna modifica","Solo Rimuovi Anno","Rimuovi e Sostituisci Anno"),
@@ -333,7 +322,6 @@ elif menu == "⚡ Produzione":
         azione = "Sostituisci" if modalita_testo == "Rimuovi e Sostituisci Anno" else "Rimuovi"
         return elabora_testo_dinamico(
             img_pil             = img_pil,
-            openai_api_key      = openai_key,
             azione              = azione,
             new_text_str        = new_text_input,
             font_file_bytes     = font_bytes,
