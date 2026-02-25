@@ -7,7 +7,7 @@ import zipfile
 import json
 
 # --- CONFIGURAZIONE ---
-st.set_page_config(page_title="PhotoBook Mockup Compositor - V4 (Con Rimozione Testo)", layout="wide")
+st.set_page_config(page_title="PhotoBook Mockup Compositor - V5 SMART", layout="wide")
 
 if 'uploader_key' not in st.session_state:
     st.session_state.uploader_key = 0
@@ -168,15 +168,53 @@ def composite_v3_fixed(tmpl_pil, cover_pil, template_name="", border_offset=None
         tmpl_rgb.putalpha(alpha_mask)
     return tmpl_rgb
 
-# --- FUNZIONE RIMOZIONE TESTO ---
-def applica_censura(img_pil, x1_pct, x2_pct, y1_pct, y2_pct, sample_x, sample_y):
+# --- NUOVA FUNZIONE: RIMOZIONE TESTO SMART ---
+def applica_censura_smart(img_pil, search_x1, search_x2, search_y1, search_y2, sample_x, sample_y, padding=8):
+    """
+    Cerca la scritta all'interno di una 'Zona di Ricerca' e la copre dinamicamente.
+    """
     img = img_pil.convert("RGB")
-    w, h = img.size
-    bg_color = img.getpixel((sample_x, sample_y))
+    img_arr = np.array(img)
+    h, w, _ = img_arr.shape
+    
+    # 1. Trova il colore di sfondo per QUESTA immagine
+    bg_color = img_arr[sample_y, sample_x]
+    
+    # 2. Converti le percentuali in coordinate pixel per la zona di ricerca
+    sx1, sy1 = int((search_x1 * w) / 100), int((search_y1 * h) / 100)
+    sx2, sy2 = int((search_x2 * w) / 100), int((search_y2 * h) / 100)
+    
+    # 3. Estrai l'area di ricerca
+    search_zone = img_arr[sy1:sy2, sx1:sx2]
+    
+    # Se la zona di ricerca è vuota/invalida, ritorna l'immagine originale
+    if search_zone.size == 0:
+        return img
+        
+    # 4. Trova i pixel DIVERSI dal colore di sfondo (tolleranza per artefatti JPEG)
+    diff = np.abs(search_zone.astype(int) - bg_color.astype(int))
+    mask = np.sum(diff, axis=2) > 40  # 40 è la tolleranza. Se il pixel differisce, è "testo"
+    
+    # Se non c'è testo diverso dallo sfondo, ritorna l'immagine intatta
+    if not np.any(mask):
+        return img
+        
+    # 5. Calcola le coordinate esatte della scritta trovata
+    rows = np.any(mask, axis=1)
+    cols = np.any(mask, axis=0)
+    ymin, ymax = np.where(rows)[0][[0, -1]]
+    xmin, xmax = np.where(cols)[0][[0, -1]]
+    
+    # 6. Riporta le coordinate in scala globale (aggiungendo un po' di margine/padding)
+    final_x1 = max(0, sx1 + xmin - padding)
+    final_y1 = max(0, sy1 + ymin - padding)
+    final_x2 = min(w, sx1 + xmax + padding)
+    final_y2 = min(h, sy1 + ymax + padding)
+    
+    # 7. Disegna la toppa esatta
     draw = ImageDraw.Draw(img)
-    x1, y1 = int((x1_pct * w) / 100), int((y1_pct * h) / 100)
-    x2, y2 = int((x2_pct * w) / 100), int((y2_pct * h) / 100)
-    draw.rectangle([x1, y1, x2, y2], fill=bg_color)
+    draw.rectangle([final_x1, final_y1, final_x2, final_y2], fill=tuple(bg_color))
+    
     return img
 
 # --- LIBRERIA ---
@@ -240,19 +278,20 @@ elif menu == "🎯 Calibrazione":
 elif menu == "⚡ Produzione":
     scelta = st.radio("Formato:", ["Verticali", "Orizzontali", "Quadrati"], horizontal=True)
     
-    # --- NUOVA SEZIONE: PRE-PROCESSING DESIGN ---
-    with st.expander("🖌️ Opzioni di Pulizia Design (Es. Rimuovi 2025)", expanded=False):
-        usa_censura = st.checkbox("Attiva rimozione testo/oggetti dal design prima di applicarlo")
+    # --- OPZIONI CENSURA ---
+    with st.expander("🖌️ Auto-Rimozione Testo (Insegue la scritta)", expanded=False):
+        st.write("Imposta una **Zona di Ricerca** ampia (il riquadro in cui solitamente appare il '2025'). Lo script cercherà la scritta lì dentro e la cancellerà in base alle sue dimensioni reali.")
+        usa_censura = st.checkbox("Attiva auto-rimozione per questi caricamenti")
         if usa_censura:
             col_cen1, col_cen2 = st.columns(2)
-            # Percentuali di default calibrate sulla tua immagine quadrata
-            cens_x1 = col_cen1.number_input("Inizio X (%)", 0.0, 100.0, 58.0)
-            cens_x2 = col_cen1.number_input("Fine X (%)", 0.0, 100.0, 85.0)
-            cens_y1 = col_cen2.number_input("Inizio Y (%)", 0.0, 100.0, 24.0)
-            cens_y2 = col_cen2.number_input("Fine Y (%)", 0.0, 100.0, 36.0)
-            st.caption("Coordinate del pixel per campionare il colore di sfondo (di default in alto a sinistra):")
-            samp_x = st.number_input("X Campione", 0, 10000, 10)
-            samp_y = st.number_input("Y Campione", 0, 10000, 10)
+            # Area di ricerca bella ampia per la tua immagine (prende metà destra)
+            cens_x1 = col_cen1.slider("Ricerca Inizio X (%)", 0, 100, 50)
+            cens_x2 = col_cen1.slider("Ricerca Fine X (%)", 0, 100, 95)
+            cens_y1 = col_cen2.slider("Ricerca Inizio Y (%)", 0, 100, 20)
+            cens_y2 = col_cen2.slider("Ricerca Fine Y (%)", 0, 100, 45)
+            
+            samp_x = st.number_input("Pixel Colore Sfondo X (es: 10)", 0, 10000, 10)
+            samp_y = st.number_input("Pixel Colore Sfondo Y (es: 10)", 0, 10000, 10)
 
     st.divider()
 
@@ -260,10 +299,9 @@ elif menu == "⚡ Produzione":
     if up and libreria[scelta]:
         d_img = Image.open(up)
         
-        # Se attivata la censura, modifichiamo l'immagine caricata
         if usa_censura:
-            d_img = applica_censura(d_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y)
-            st.info("Anteprima: Il design base è stato ripulito!")
+            d_img = applica_censura_smart(d_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y)
+            st.info("Anteprima: La scritta è stata localizzata e rimossa!")
             st.image(d_img, caption="Design Pulito", width=250)
 
         cols = st.columns(4)
@@ -284,9 +322,9 @@ elif menu == "⚡ Produzione":
             for b_file in batch:
                 b_img = Image.open(b_file)
                 
-                # Applica la censura anche in batch se attivata!
+                # CENSURA DINAMICA NEL BATCH
                 if usa_censura:
-                    b_img = applica_censura(b_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y)
+                    b_img = applica_censura_smart(b_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y)
 
                 base_name = os.path.splitext(b_file.name)[0]
                 if base_name.lower().endswith('.png'):
@@ -310,7 +348,7 @@ elif menu == "⚡ Produzione":
                     progress.progress(count/total)
         st.session_state.zip_ready = True
         st.session_state.zip_data = zip_buf.getvalue()
-        st.success("Tutto pronto, compresa l'eliminazione del testo sui design!")
+        st.success("Batch Completato! Scritte rimosse automaticamente su tutte le copertine.")
     
     if st.session_state.get('zip_ready'):
         st.download_button("📥 SCARICA ZIP", st.session_state.zip_data, f"Mockups_{scelta}.zip", "application/zip")
