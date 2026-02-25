@@ -350,10 +350,14 @@ def elabora_testo_dinamico(img_pil, openai_api_key=None, azione="Rimuovi",
         return img_pil
 
     text_color = text_color_override if text_color_override else auto_text_color
+
+    # Espandi bbox verso sinistra per coprire eventuali residui del testo originale
+    x1 = max(0, x1 - 20)
+
     bbox_h = y2 - y1
     bbox_w = x2 - x1
 
-    padding = 6
+    padding = 15
     draw = ImageDraw.Draw(img)
     draw.rectangle([x1-padding, y1-padding, x2+padding, y2+padding], fill=bg_color)
 
