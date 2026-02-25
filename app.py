@@ -130,7 +130,7 @@ def trova_anno_gpt(img_pil, openai_api_key):
     )
 
     payload = json.dumps({
-        "model": "gpt-4o-mini", "max_tokens": 80,
+        "model": "gpt-4o", "max_tokens": 80,
         "messages": [{"role":"user","content":[
             {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}","detail":"high"}},
             {"type":"text","text":prompt}
@@ -154,7 +154,7 @@ def trova_anno_gpt(img_pil, openai_api_key):
             x2 = min(orig_w-1, int(r["x2"]*sx))
             y2 = min(orig_h-1, int(r["y2"]*sy))
             # Sanity: bbox non troppo grande (max 60% larghezza, max 25% altezza)
-            if (x2-x1) > orig_w*0.6 or (y2-y1) > orig_h*0.25:
+            if (x2-x1) > orig_w*0.85 or (y2-y1) > orig_h*0.35:
                 return None
             # Sanity: deve essere nel terzo superiore (anno sta sempre in alto)
             if y1 > orig_h*0.6:
@@ -213,7 +213,7 @@ def elabora_testo_dinamico(img_pil, openai_api_key, azione="Rimuovi",
 
     # Cancella con padding generoso
     draw = ImageDraw.Draw(img)
-    draw.rectangle([x1-15, y1-10, x2+15, y2+10], fill=bg_color)
+    draw.rectangle([x1-30, y1-15, x2+30, y2+15], fill=bg_color)
 
     # Riscrivi
     if azione == "Sostituisci" and new_text_str and font_file_bytes:
