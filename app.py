@@ -165,55 +165,154 @@ def composite_v3_fixed(tmpl_pil, cover_pil, template_name="", border_offset=None
         tmpl_rgb.putalpha(alpha_mask)
     return tmpl_rgb
 
-# --- SOSTITUZIONE ANNO (scansione pixel diretta, no GPT) ---
+# --- SOSTITUZIONE ANNO ---
 def trova_anno_pixel(img_pil):
     """
-    Trova il bbox dell'anno cercando pixel con colore molto diverso dallo sfondo
-    nella zona sotto il titolo (dal 15% al 50% dell'altezza).
-    Restituisce (x1, y1, x2, y2, bg_color, text_color) o None.
+    Trova il bbox dell'anno cercando pixel azzurri/colorati
+    nella fascia centrale dell'immagine (15%-55% altezza).
+    Usa il colore più raro nella zona come colore dell'anno.
     """
     img = img_pil.convert("RGB")
     img_arr = np.array(img)
     h, w = img_arr.shape[:2]
 
-    # Colore sfondo: campiona angolo top-left (zona neutra)
-    bg_sample = img_arr[5:30, 5:30].reshape(-1, 3)
-    bg_color = tuple(int(v) for v in np.median(bg_sample, axis=0))
-    bg_arr = np.array(bg_color)
-
-    # Cerca pixel molto diversi dallo sfondo nella fascia y=15%-50%
-    # (sotto il titolo grande, sopra le illustrazioni)
     y_start = int(h * 0.15)
     y_end   = int(h * 0.55)
     zone = img_arr[y_start:y_end, :, :]
-    diffs = np.abs(zone.astype(int) - bg_arr).sum(axis=2)
+    pixels = zone.reshape(-1, 3).astype(int)
 
-    # Soglia: pixel che differiscono molto dallo sfondo
-    text_mask = diffs > 80
+    # Colore dominante = sfondo
+    rounded = (pixels // 25 * 25)
+    unique, counts = np.unique(rounded, axis=0, return_counts=True)
+    bg_color = tuple(int(v) for v in unique[np.argmax(counts)])
+    bg_arr = np.array(bg_color)
 
-    if not text_mask.any():
+    # Cerca SOLO pixel con caratteristiche di testo:
+    # - diversi dallo sfondo
+    # - in una zona compatta (non illustrazioni sparse)
+    diff = np.abs(pixels - bg_arr).sum(axis=1)
+    candidate_mask = (diff > 60).reshape(zone.shape[:2])
+
+    # Usa label per trovare blob e prendi quello più in alto a destra
+    # (l'anno è sempre in alto a destra sotto il titolo)
+    from PIL import Image as PILImage
+    import io as _io
+
+    # Erodi per separare i blob
+    rows_with_text = np.where(np.any(candidate_mask, axis=1))[0]
+    if len(rows_with_text) == 0:
         return None
 
-    # Trova bounding box
-    rows = np.any(text_mask, axis=1)
-    cols = np.any(text_mask, axis=0)
-    ys = np.where(rows)[0]
+    # Scansiona riga per riga per trovare cluster compatti
+    best = None
+    best_score = -1
+
+    # Cerca righe con pixel compatti (testo) non sparse (illustrazione)
+    for ys in range(0, candidate_mask.shape[0]-5, 3):
+        row = candidate_mask[ys, :]
+        if not row.any():
+            continue
+        xs_idx = np.where(row)[0]
+        # Testo: pixel consecutivi (gap max 5px)
+        gaps = np.diff(xs_idx)
+        if len(gaps) > 0 and gaps.max() < 10:
+            # Compatto = probabile testo
+            score = xs_idx[-1] + ys  # preferisci in basso a destra
+            if score > best_score:
+                best_score = score
+                best_row_y = ys
+
+    if best_score < 0:
+        return None
+
+    # Espandi dalla riga migliore per trovare tutto il bbox del testo
+    # Cerca verticalmente righe contigue compatte
+    y_top = best_row_y
+    y_bot = best_row_y
+    for y in range(best_row_y, -1, -1):
+        row = candidate_mask[y, :]
+        if row.any():
+            xs = np.where(row)[0]
+            if len(xs) > 3:
+                y_top = y
+            else:
+                break
+    for y in range(best_row_y, candidate_mask.shape[0]):
+        row = candidate_mask[y, :]
+        if row.any():
+            xs = np.where(row)[0]
+            if len(xs) > 3:
+                y_bot = y
+            else:
+                break
+
+    # BBox finale
+    region_rows = candidate_mask[y_top:y_bot+1, :]
+    cols = np.any(region_rows, axis=0)
+    if not cols.any():
+        return None
     xs = np.where(cols)[0]
+    x1, x2 = int(xs[0]), int(xs[-1])
+    y1 = y_start + y_top
+    y2 = y_start + y_bot
 
-    x1 = int(xs[0])
-    x2 = int(xs[-1])
-    y1 = y_start + int(ys[0])
-    y2 = y_start + int(ys[-1])
-
-    # Colore testo: mediana dei pixel anomali
-    region = img_arr[y1:y2, x1:x2].reshape(-1, 3)
-    px_diffs = np.abs(region.astype(int) - bg_arr).sum(axis=1)
-    text_pixels = region[px_diffs > 80]
-    if len(text_pixels) == 0:
+    # Sanity check: deve essere ragionevolmente piccolo (non l'intera immagine)
+    if (x2-x1) > w*0.7 or (y2-y1) > h*0.3:
         return None
-    text_color = tuple(int(v) for v in np.median(text_pixels, axis=0))
+
+    # Colore sfondo reale
+    left_band = img_arr[y1:y2, max(0,x1-50):max(0,x1-5)]
+    if left_band.size > 0:
+        bg_color = tuple(int(v) for v in np.median(left_band.reshape(-1,3), axis=0))
+
+    # Colore testo
+    reg = img_arr[y1:y2, x1:x2].reshape(-1,3)
+    diffs2 = np.abs(reg.astype(int) - np.array(bg_color)).sum(axis=1)
+    text_pix = reg[diffs2 > 60]
+    if len(text_pix) == 0:
+        return None
+    text_color = tuple(int(v) for v in np.median(text_pix, axis=0))
 
     return x1, y1, x2, y2, bg_color, text_color
+
+
+def trova_anno_con_gpt(img_pil, openai_api_key):
+    """Fallback GPT-4o mini se la scansione pixel non trova niente."""
+    import json, base64, urllib.request, re
+    buf = io.BytesIO()
+    img_pil.convert("RGB").save(buf, format="JPEG", quality=85)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    iw, ih = img_pil.size
+    prompt = (
+        f"Questa immagine è {iw}x{ih} pixel. "
+        "Trova SOLO il testo che rappresenta un anno (20XX). "
+        "NON includere il titolo principale. "
+        "Rispondi SOLO con JSON: "
+        '{"trovato":true,"x1":312,"y1":156,"x2":445,"y2":205} '
+        "usando coordinate pixel assolute. "
+        'Se non trovi: {"trovato":false}'
+    )
+    payload = json.dumps({
+        "model": "gpt-4o-mini", "max_tokens": 100,
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"}},
+            {"type": "text", "text": prompt}
+        ]}]
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions", data=payload,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {openai_api_key}"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+            raw = re.sub(r"```json|```", "", data["choices"][0]["message"]["content"].strip()).strip()
+            r = json.loads(raw)
+            if r.get("trovato"):
+                return r["x1"], r["y1"], r["x2"], r["y2"]
+    except:
+        pass
+    return None
 
 
 def elabora_testo_dinamico(img_pil, openai_api_key=None, azione="Rimuovi",
@@ -227,28 +326,40 @@ def elabora_testo_dinamico(img_pil, openai_api_key=None, azione="Rimuovi",
     img_arr = np.array(img)
     h, w = img_arr.shape[:2]
 
-    # Trova anno con scansione pixel
+    # Prima prova scansione pixel
     result = trova_anno_pixel(img_pil)
-    if result is None:
-        st.info("ℹ️ Nessun testo trovato — immagine lasciata intatta.")
+
+    if result:
+        x1, y1, x2, y2, bg_color, auto_text_color = result
+    elif openai_api_key:
+        # Fallback GPT
+        coords = trova_anno_con_gpt(img_pil, openai_api_key)
+        if coords is None:
+            st.info("ℹ️ Anno non trovato — immagine lasciata intatta.")
+            return img_pil
+        x1, y1, x2, y2 = coords
+        # Campiona sfondo e testo
+        left_band = img_arr[y1:y2, max(0,x1-50):max(0,x1-5)]
+        bg_color = tuple(int(v) for v in np.median(left_band.reshape(-1,3), axis=0)) if left_band.size > 0 else (255,255,255)
+        reg = img_arr[y1:y2, x1:x2].reshape(-1,3)
+        diffs = np.abs(reg.astype(int) - np.array(bg_color)).sum(axis=1)
+        text_pix = reg[diffs > 60]
+        auto_text_color = tuple(int(v) for v in np.median(text_pix, axis=0)) if len(text_pix) > 0 else (0,0,0)
+    else:
+        st.info("ℹ️ Anno non trovato — immagine lasciata intatta.")
         return img_pil
 
-    x1, y1, x2, y2, bg_color, auto_text_color = result
     text_color = text_color_override if text_color_override else auto_text_color
-
     bbox_h = y2 - y1
     bbox_w = x2 - x1
 
-    # Cancella testo originale
     padding = 6
     draw = ImageDraw.Draw(img)
     draw.rectangle([x1-padding, y1-padding, x2+padding, y2+padding], fill=bg_color)
 
-    # Scrivi nuovo testo
     if azione == "Sostituisci" and new_text_str and font_file_bytes:
         try:
             if auto_scale:
-                # Matcha altezza del testo originale
                 fs = 8
                 while fs < 500:
                     font = ImageFont.truetype(io.BytesIO(font_file_bytes), fs)
@@ -260,14 +371,13 @@ def elabora_testo_dinamico(img_pil, openai_api_key=None, azione="Rimuovi",
                 fs = font_size
             font = ImageFont.truetype(io.BytesIO(font_file_bytes), fs)
             tb = font.getbbox(new_text_str)
-            tw = tb[2] - tb[0]
-            th = tb[3] - tb[1]
+            tw, th = tb[2]-tb[0], tb[3]-tb[1]
         except Exception as e:
             st.warning(f"Errore font: {e}")
             return img
 
-        draw_x = x2 - tw           # allineato a DESTRA
-        draw_y = y1 + (bbox_h - th) // 2  # centrato verticalmente
+        draw_x = x2 - tw
+        draw_y = y1 + (bbox_h - th) // 2
         draw.text((draw_x, draw_y), new_text_str, font=font, fill=text_color)
 
     return img
@@ -341,6 +451,8 @@ elif menu == "⚡ Produzione":
 
     with st.expander("🤖 Sostituzione Anno", expanded=True):
 
+        openai_key = st.text_input("🔑 OpenAI API Key (opzionale, fallback se pixel scan fallisce)", type="password")
+
         modalita_testo = st.radio(
             "Azione:",
             ("Nessuna modifica", "Solo Rimuovi Anno", "Rimuovi e Sostituisci Anno"),
@@ -386,6 +498,7 @@ elif menu == "⚡ Produzione":
         )
         return elabora_testo_dinamico(
             img_pil             = img_pil,
+            openai_api_key      = openai_key,
             azione              = azione_passata,
             new_text_str        = new_text_input,
             font_file_bytes     = font_bytes,
