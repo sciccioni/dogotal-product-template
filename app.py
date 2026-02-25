@@ -7,7 +7,7 @@ import zipfile
 import json
 
 # --- CONFIGURAZIONE ---
-st.set_page_config(page_title="PhotoBook Mockup - V6 SOSTITUZIONE TESTO", layout="wide")
+st.set_page_config(page_title="PhotoBook Mockup - V7 SOSTITUZIONE MIGLIORATA", layout="wide")
 
 if 'uploader_key' not in st.session_state:
     st.session_state.uploader_key = 0
@@ -168,8 +168,33 @@ def composite_v3_fixed(tmpl_pil, cover_pil, template_name="", border_offset=None
         tmpl_rgb.putalpha(alpha_mask)
     return tmpl_rgb
 
-# --- FUNZIONE SOSTITUZIONE TESTO SMART ---
-def sostituisci_testo_smart(img_pil, search_x1, search_x2, search_y1, search_y2, sample_x, sample_y, new_text_str="", font_obj=None, padding=8):
+# --- FUNZIONE RIMOZIONE TESTO SMART (SOLO RIMOZIONE) ---
+def applica_censura_smart(img_pil, search_x1, search_x2, search_y1, search_y2, sample_x, sample_y, padding=8):
+    img = img_pil.convert("RGB")
+    img_arr = np.array(img)
+    h, w, _ = img_arr.shape
+    bg_color = img_arr[sample_y, sample_x]
+    sx1, sy1 = int((search_x1 * w) / 100), int((search_y1 * h) / 100)
+    sx2, sy2 = int((search_x2 * w) / 100), int((search_y2 * h) / 100)
+    search_zone = img_arr[sy1:sy2, sx1:sx2]
+    if search_zone.size == 0: return img
+    diff = np.abs(search_zone.astype(int) - bg_color.astype(int))
+    mask = np.sum(diff, axis=2) > 40
+    if not np.any(mask): return img
+    rows = np.any(mask, axis=1)
+    cols = np.any(mask, axis=0)
+    ymin, ymax = np.where(rows)[0][[0, -1]]
+    xmin, xmax = np.where(cols)[0][[0, -1]]
+    final_x1 = max(0, sx1 + xmin - padding)
+    final_y1 = max(0, sy1 + ymin - padding)
+    final_x2 = min(w, sx1 + xmax + padding)
+    final_y2 = min(h, sy1 + ymax + padding)
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([final_x1, final_y1, final_x2, final_y2], fill=tuple(bg_color))
+    return img
+
+# --- FUNZIONE SOSTITUZIONE TESTO SMART (CON OFFSET) ---
+def sostituisci_testo_smart(img_pil, search_x1, search_x2, search_y1, search_y2, sample_x, sample_y, new_text_str="", font_obj=None, padding=8, x_offset=0, y_offset=0):
     img = img_pil.convert("RGB")
     img_arr = np.array(img)
     h, w, _ = img_arr.shape
@@ -190,13 +215,12 @@ def sostituisci_testo_smart(img_pil, search_x1, search_x2, search_y1, search_y2,
     
     if not np.any(mask): return img
         
-    # --- NUOVO: Campiona il colore del testo originale ---
+    # 4. Campiona il colore del testo originale
     text_pixels = search_zone[mask]
-    # Calcola la media dei colori dei pixel che formano la scritta
     avg_text_color = np.mean(text_pixels, axis=0).astype(int)
     text_color_tuple = tuple(avg_text_color)
 
-    # 4. Coordinate vecchia scritta
+    # 5. Coordinate vecchia scritta
     rows = np.any(mask, axis=1)
     cols = np.any(mask, axis=0)
     ymin, ymax = np.where(rows)[0][[0, -1]]
@@ -208,13 +232,13 @@ def sostituisci_testo_smart(img_pil, search_x1, search_x2, search_y1, search_y2,
     final_y2 = min(h, sy1 + ymax + padding)
     
     draw = ImageDraw.Draw(img)
-    # 5. Cancella vecchia scritta
+    # 6. Cancella vecchia scritta
     draw.rectangle([final_x1, final_y1, final_x2, final_y2], fill=tuple(bg_color))
     
-    # --- NUOVO: Inserisci nuova scritta ---
+    # 7. Inserisci nuova scritta con OFFSET
     if new_text_str and font_obj:
-        # Usa le coordinate in alto a sinistra della vecchia scritta come punto di partenza
-        draw.text((final_x1 + padding, final_y1 + padding), new_text_str, font=font_obj, fill=text_color_tuple)
+        # Usa le coordinate originali + offset e padding
+        draw.text((final_x1 + padding + x_offset, final_y1 + padding + y_offset), new_text_str, font=font_obj, fill=text_color_tuple)
     
     return img
 
@@ -279,38 +303,49 @@ elif menu == "🎯 Calibrazione":
 elif menu == "⚡ Produzione":
     scelta = st.radio("Formato:", ["Verticali", "Orizzontali", "Quadrati"], horizontal=True)
     
-    # --- OPZIONI SOSTITUZIONE TESTO ---
-    with st.expander("🖌️ Sostituzione Testo Smart (Trova '2025' e scrivi altro)", expanded=False):
-        st.write("Imposta la Zona di Ricerca per trovare la vecchia scritta.")
-        usa_sostituzione = st.checkbox("Attiva sostituzione testo")
+    # --- OPZIONI MODIFICA TESTO (Mutuamente Esclusive) ---
+    with st.expander("🖌️ Modifica Testo Smart (Rimuovi o Sostituisci)", expanded=False):
+        # Selezione della modalità
+        modalita_testo = st.radio(
+            "Scegli l'azione da eseguire sul testo (es. '2025'):",
+            ("Nessuna modifica", "Rimuovi Solo", "Rimuovi e Sostituisci"),
+            index=0,
+            horizontal=True
+        )
         
-        if usa_sostituzione:
-            col_txt1, col_txt2 = st.columns(2)
-            new_text_input = col_txt1.text_input("Nuovo Testo (es. 2026)", value="2026")
-            font_size_input = col_txt2.number_input("Dimensione Font", value=60, min_value=10)
-            font_file = col_txt1.file_uploader("Carica file Font (.ttf o .otf)", type=['ttf', 'otf'])
-            
-            loaded_font = None
-            if font_file:
-                try:
-                    # Carica il font dalla memoria
-                    loaded_font = ImageFont.truetype(io.BytesIO(font_file.read()), font_size_input)
-                    col_txt2.success("Font caricato!")
-                except:
-                    col_txt2.error("Errore caricamento font.")
-            else:
-                col_txt2.warning("Carica un font per risultati migliori.")
-
-            st.divider()
+        # Parametri comuni (Zona di ricerca e Campione Colore)
+        if modalita_testo != "Nessuna modifica":
             st.caption("Zona di Ricerca e Campione Colore Sfondo:")
             col_cen1, col_cen2 = st.columns(2)
             cens_x1 = col_cen1.slider("Ricerca Inizio X (%)", 0, 100, 50)
             cens_x2 = col_cen1.slider("Ricerca Fine X (%)", 0, 100, 95)
             cens_y1 = col_cen2.slider("Ricerca Inizio Y (%)", 0, 100, 20)
             cens_y2 = col_cen2.slider("Ricerca Fine Y (%)", 0, 100, 45)
-            
             samp_x = st.number_input("Pixel Colore Sfondo X", 0, 10000, 10)
             samp_y = st.number_input("Pixel Colore Sfondo Y", 0, 10000, 10)
+            st.divider()
+
+        # Parametri specifici per "Rimuovi e Sostituisci"
+        if modalita_testo == "Rimuovi e Sostituisci":
+            col_txt1, col_txt2 = st.columns(2)
+            new_text_input = col_txt1.text_input("Nuovo Testo (es. 2026)", value="2026")
+            font_size_input = col_txt2.number_input("Dimensione Font", value=60, min_value=10)
+            font_file = col_txt1.file_uploader("Carica file Font (.ttf o .otf)", type=['ttf', 'otf'])
+            
+            # --- NUOVO: Slider per l'offset della posizione ---
+            x_offset_val = col_txt2.slider("Sposta Orizzontalmente (X Offset)", -200, 200, 0, help="Valori positivi spostano a destra, negativi a sinistra.")
+            y_offset_val = col_txt2.slider("Sposta Verticalmente (Y Offset)", -200, 200, 0, help="Valori positivi spostano in basso, negativi in alto.")
+
+            loaded_font = None
+            if font_file:
+                try:
+                    loaded_font = ImageFont.truetype(io.BytesIO(font_file.read()), font_size_input)
+                    col_txt1.success("Font caricato!")
+                except:
+                    col_txt1.error("Errore caricamento font.")
+            else:
+                col_txt1.warning("Carica un font per la sostituzione.")
+            st.divider()
 
     st.divider()
 
@@ -318,11 +353,15 @@ elif menu == "⚡ Produzione":
     if up and libreria[scelta]:
         d_img = Image.open(up)
         
-        if usa_sostituzione:
-            # Applica la sostituzione smart
-            d_img = sostituisci_testo_smart(d_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y, new_text_input, loaded_font)
-            st.info("Anteprima: Testo sostituito (se trovato)!")
-            st.image(d_img, caption="Design Modificato", width=250)
+        # Applica la modifica scelta all'anteprima
+        if modalita_testo == "Rimuovi Solo":
+            d_img = applica_censura_smart(d_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y)
+            st.info("Anteprima: Testo rimosso (se trovato)!")
+            st.image(d_img, caption="Design Rimosso", width=250)
+        elif modalita_testo == "Rimuovi e Sostituisci":
+            d_img = sostituisci_testo_smart(d_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y, new_text_input, loaded_font, x_offset=x_offset_val, y_offset=y_offset_val)
+            st.info("Anteprima: Testo sostituito e riposizionato (se trovato)!")
+            st.image(d_img, caption="Design Sostituito", width=250)
 
         cols = st.columns(4)
         for i, (t_name, t_img) in enumerate(libreria[scelta].items()):
@@ -342,9 +381,11 @@ elif menu == "⚡ Produzione":
             for b_file in batch:
                 b_img = Image.open(b_file)
                 
-                # SOSTITUZIONE DINAMICA NEL BATCH
-                if usa_sostituzione:
-                    b_img = sostituisci_testo_smart(b_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y, new_text_input, loaded_font)
+                # Applica la modifica scelta al batch
+                if modalita_testo == "Rimuovi Solo":
+                    b_img = applica_censura_smart(b_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y)
+                elif modalita_testo == "Rimuovi e Sostituisci":
+                    b_img = sostituisci_testo_smart(b_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y, new_text_input, loaded_font, x_offset=x_offset_val, y_offset=y_offset_val)
 
                 base_name = os.path.splitext(b_file.name)[0]
                 if base_name.lower().endswith('.png'):
@@ -368,7 +409,7 @@ elif menu == "⚡ Produzione":
                     progress.progress(count/total)
         st.session_state.zip_ready = True
         st.session_state.zip_data = zip_buf.getvalue()
-        st.success("Batch Completato! Testi sostituiti e mockup generati.")
+        st.success("Batch Completato! Modifiche al testo applicate.")
     
     if st.session_state.get('zip_ready'):
         st.download_button("📥 SCARICA ZIP", st.session_state.zip_data, f"Mockups_{scelta}.zip", "application/zip")
