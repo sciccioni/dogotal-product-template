@@ -5,9 +5,10 @@ import os
 import io
 import zipfile
 import json
+import scipy.ndimage as ndi  # <-- IL NUOVO CERVELLO MATEMATICO
 
 # --- CONFIGURAZIONE ---
-st.set_page_config(page_title="PhotoBook Mockup - V8 SOSTITUZIONE DI PRECISIONE", layout="wide")
+st.set_page_config(page_title="PhotoBook Mockup - V9 FULL AUTO", layout="wide")
 
 if 'uploader_key' not in st.session_state:
     st.session_state.uploader_key = 0
@@ -168,60 +169,94 @@ def composite_v3_fixed(tmpl_pil, cover_pil, template_name="", border_offset=None
         tmpl_rgb.putalpha(alpha_mask)
     return tmpl_rgb
 
-# --- FUNZIONI TESTO SMART ---
-def elabora_testo_smart(img_pil, search_x1, search_x2, search_y1, search_y2, sample_x, sample_y, azione="Rimuovi", new_text_str="", font_obj=None, padding=8, x_offset=0, y_offset=0, debug_mode=False):
+
+# --- NUOVO CERVELLO: TROVA ANNO IN AUTOMATICO ---
+def elabora_testo_dinamico(img_pil, sample_x, sample_y, azione="Rimuovi", new_text_str="", font_obj=None, x_offset=0, y_offset=0, padding=10):
+    """
+    Trova dinamicamente il testo in basso a destra (l'anno), cancella solo quello e
+    lo sostituisce ancorandolo a DESTRA per non farlo sbordare. Zero coordinate manuali.
+    """
     img = img_pil.convert("RGB")
     img_arr = np.array(img)
     h, w, _ = img_arr.shape
     
+    # 1. Trova il colore di sfondo
     bg_color = img_arr[sample_y, sample_x]
     
-    sx1, sy1 = int((search_x1 * w) / 100), int((search_y1 * h) / 100)
-    sx2, sy2 = int((search_x2 * w) / 100), int((search_y2 * h) / 100)
-    search_zone = img_arr[sy1:sy2, sx1:sx2]
-    
-    if search_zone.size == 0: return img
-        
-    diff = np.abs(search_zone.astype(int) - bg_color.astype(int))
+    # 2. Maschera tutto ciò che non è sfondo
+    diff = np.abs(img_arr.astype(int) - bg_color.astype(int))
     mask = np.sum(diff, axis=2) > 40
     
     if not np.any(mask): 
-        if debug_mode:
-            draw = ImageDraw.Draw(img)
-            draw.rectangle([sx1, sy1, sx2, sy2], outline="blue", width=3)
+        return img # Immagine vuota o tutta tinta unita
+        
+    # 3. DILATAZIONE: Usa scipy per "fondere" le lettere vicine e formare parole/blocchi solidi
+    # 15 iterazioni chiudono i gap tra i numeri 2, 0, 2, 5.
+    dilated = ndi.binary_dilation(mask, iterations=15)
+    
+    # 4. Etichetta i blocchi distinti (es. ROMA = blocco 1, 2025 = blocco 2)
+    labels, num_features = ndi.label(dilated)
+    
+    if num_features == 0: 
         return img
         
-    text_pixels = search_zone[mask]
-    avg_text_color = np.mean(text_pixels, axis=0).astype(int)
-    text_color_tuple = tuple(avg_text_color)
-
-    rows = np.any(mask, axis=1)
-    cols = np.any(mask, axis=0)
-    ymin, ymax = np.where(rows)[0][[0, -1]]
-    xmin, xmax = np.where(cols)[0][[0, -1]]
+    # 5. TROVA L'ANNO: Euristica intelligente. L'anno è sempre il blocco più in basso e a destra.
+    # Calcoliamo X_MAX + Y_MAX per ogni blocco. Quello col punteggio più alto vince.
+    best_bbox = None
+    max_score = -1
+    best_blob_mask = None
     
-    final_x1 = max(0, sx1 + xmin - padding)
-    final_y1 = max(0, sy1 + ymin - padding)
-    final_x2 = min(w, sx1 + xmax + padding)
-    final_y2 = min(h, sy1 + ymax + padding)
+    for i in range(1, num_features + 1):
+        blob_mask = (labels == i)
+        rows = np.any(blob_mask, axis=1)
+        cols = np.any(blob_mask, axis=0)
+        
+        ymin, ymax = np.where(rows)[0][[0, -1]]
+        xmin, xmax = np.where(cols)[0][[0, -1]]
+        
+        score = xmax + ymax  # Il vero trucco è qui
+        
+        if score > max_score:
+            max_score = score
+            best_bbox = (xmin, ymin, xmax, ymax)
+            best_blob_mask = blob_mask
+            
+    if not best_bbox: return img
     
+    xmin, ymin, xmax, ymax = best_bbox
+    
+    # 6. Colore del testo: Prende i pixel originali (non dilatati) dentro a questo blocco
+    text_pixels = img_arr[mask & best_blob_mask]
+    if len(text_pixels) > 0:
+        avg_color = np.median(text_pixels, axis=0).astype(int)
+    else:
+        avg_color = np.array([255, 255, 255])
+        
+    # 7. CANCELLA IL VECCHIO TESTO
     draw = ImageDraw.Draw(img)
-
-    if debug_mode:
-        # Disegna Riquadro Blu (Area di Ricerca)
-        draw.rectangle([sx1, sy1, sx2, sy2], outline="blue", width=3)
-        # Disegna Riquadro Rosso (Cosa viene considerato "Testo da rimuovere")
-        draw.rectangle([final_x1, final_y1, final_x2, final_y2], outline="red", width=4)
-        # Segna il punto di campionamento
-        r=5
-        draw.ellipse([sample_x-r, sample_y-r, sample_x+r, sample_y+r], fill="green", outline="white")
-        return img
-
-    # Se non siamo in debug, procediamo con la cancellazione/sostituzione vera e propria
-    draw.rectangle([final_x1, final_y1, final_x2, final_y2], fill=tuple(bg_color))
+    erase_x1 = max(0, xmin - padding)
+    erase_y1 = max(0, ymin - padding)
+    erase_x2 = min(w, xmax + padding)
+    erase_y2 = min(h, ymax + padding)
     
+    # Toppa del colore di sfondo esatto
+    draw.rectangle([erase_x1, erase_y1, erase_x2, erase_y2], fill=tuple(bg_color))
+    
+    # 8. SCRIVI IL NUOVO TESTO (SE RICHIESTO)
     if azione == "Sostituisci" and new_text_str and font_obj:
-        draw.text((final_x1 + padding + x_offset, final_y1 + padding + y_offset), new_text_str, font=font_obj, fill=text_color_tuple)
+        # Prendi le misure reali del nuovo testo
+        bbox = font_obj.getbbox(new_text_str)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        
+        # ALLINEAMENTO A DESTRA: Il punto di partenza X è il vecchio margine destro MENO la larghezza del testo.
+        # Così non supererà mai l'ingombro originale del 2025.
+        draw_x = xmax - text_width + x_offset
+        
+        # ALLINEAMENTO VERTICALE: Lo posizioniamo in modo che poggi sulla stessa "linea di base" del vecchio anno.
+        draw_y = ymax - text_height + y_offset
+        
+        draw.text((draw_x, draw_y), new_text_str, font=font_obj, fill=tuple(avg_color))
     
     return img
 
@@ -286,37 +321,32 @@ elif menu == "🎯 Calibrazione":
 elif menu == "⚡ Produzione":
     scelta = st.radio("Formato:", ["Verticali", "Orizzontali", "Quadrati"], horizontal=True)
     
-    with st.expander("🖌️ Modifica Testo Smart", expanded=True):
+    with st.expander("🤖 Sostituzione Anno AUTOMATICA", expanded=True):
+        st.write("Questa modalità scansiona il design, trova in automatico il blocco di testo più in basso a destra (l'anno) e lo sostituisce allineandolo a destra per non farlo sbordare. Addio riquadri manuali!")
+        
         modalita_testo = st.radio(
             "Scegli l'azione da eseguire:",
-            ("Nessuna modifica", "Rimuovi Solo", "Rimuovi e Sostituisci"),
+            ("Nessuna modifica", "Solo Rimuovi Anno", "Rimuovi e Sostituisci Anno"),
             index=0,
             horizontal=True
         )
         
         if modalita_testo != "Nessuna modifica":
-            st.info("⚠️ **IMPORTANTE:** Usa la modalità 'Mostra Mirino' qui sotto per assicurarti che il riquadro rosso tagli SOLO i numeri e non tocchi le lettere del titolo, altrimenti cancellerà anche quelle e scriverà storto!")
-            mostra_debug = st.toggle("🔍 MOSTRA MIRINO DI PRECISIONE (Riquadro Rosso = Taglio)", value=True)
-            
-            st.caption("Coordinate Zona di Ricerca (Riquadro Blu):")
+            # Teniamo solo il pallino del colore di sfondo (sicuro, in alto a sinistra)
             col_cen1, col_cen2 = st.columns(2)
-            cens_x1 = col_cen1.slider("Ricerca Inizio X (%)", 0, 100, 50)
-            cens_x2 = col_cen1.slider("Ricerca Fine X (%)", 0, 100, 95)
-            cens_y1 = col_cen2.slider("Ricerca Inizio Y (%)", 0, 100, 25) # Alzato un po' il default per evitare il titolo
-            cens_y2 = col_cen2.slider("Ricerca Fine Y (%)", 0, 100, 50)
-            samp_x = st.number_input("Pixel Sfondo X (Pallino Verde)", 0, 10000, 10)
-            samp_y = st.number_input("Pixel Sfondo Y (Pallino Verde)", 0, 10000, 10)
+            samp_x = col_cen1.number_input("X Colore Sfondo (Alto a sx)", 0, 1000, 10)
+            samp_y = col_cen2.number_input("Y Colore Sfondo (Alto a sx)", 0, 1000, 10)
             st.divider()
 
-        if modalita_testo == "Rimuovi e Sostituisci":
+        if modalita_testo == "Rimuovi e Sostituisci Anno":
             col_txt1, col_txt2 = st.columns(2)
-            new_text_input = col_txt1.text_input("Nuovo Testo (es. 2026)", value="2026")
+            new_text_input = col_txt1.text_input("Nuovo Anno", value="2026")
             font_size_input = col_txt2.number_input("Dimensione Font", value=80, min_value=10)
             font_file = col_txt1.file_uploader("Carica file Font (.ttf o .otf)", type=['ttf', 'otf'])
             
-            st.caption("Aggiustamento Posizione Nuova Scritta:")
-            x_offset_val = col_txt2.slider("Sposta a Destra/Sinistra (X Offset)", -300, 300, 0)
-            y_offset_val = col_txt2.slider("Sposta Giù/Su (Y Offset)", -300, 300, 0)
+            st.caption("Correzioni fini (Usa solo se il font risulta storto):")
+            x_offset_val = col_txt2.slider("X Offset", -100, 100, 0, help="Sposta il testo orizzontalmente")
+            y_offset_val = col_txt2.slider("Y Offset", -100, 100, 0, help="Sposta il testo verticalmente")
 
             loaded_font = None
             if font_file:
@@ -324,9 +354,9 @@ elif menu == "⚡ Produzione":
                     loaded_font = ImageFont.truetype(io.BytesIO(font_file.read()), font_size_input)
                     col_txt1.success("Font caricato!")
                 except:
-                    col_txt1.error("Errore caricamento font.")
+                    col_txt1.error("Errore font.")
             else:
-                col_txt1.warning("Carica un font per la sostituzione.")
+                col_txt1.warning("Carica un font!")
             st.divider()
 
     up = st.file_uploader("Carica design singolo (Anteprima)", type=['jpg', 'png'], key='preview')
@@ -334,84 +364,74 @@ elif menu == "⚡ Produzione":
         d_img = Image.open(up)
         
         if modalita_testo != "Nessuna modifica":
-            azione_passata = "Sostituisci" if modalita_testo == "Rimuovi e Sostituisci" else "Rimuovi"
-            font_to_pass = loaded_font if modalita_testo == "Rimuovi e Sostituisci" else None
+            azione_passata = "Sostituisci" if modalita_testo == "Rimuovi e Sostituisci Anno" else "Rimuovi"
+            font_to_pass = loaded_font if modalita_testo == "Rimuovi e Sostituisci Anno" else None
             
-            d_img = elabora_testo_smart(
-                d_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y, 
-                azione=azione_passata, new_text_str=new_text_input if modalita_testo == "Rimuovi e Sostituisci" else "", 
-                font_obj=font_to_pass, x_offset=x_offset_val if modalita_testo == "Rimuovi e Sostituisci" else 0, 
-                y_offset=y_offset_val if modalita_testo == "Rimuovi e Sostituisci" else 0,
-                debug_mode=mostra_debug
+            d_img = elabora_testo_dinamico(
+                d_img, samp_x, samp_y, 
+                azione=azione_passata, 
+                new_text_str=new_text_input if modalita_testo == "Rimuovi e Sostituisci Anno" else "", 
+                font_obj=font_to_pass, 
+                x_offset=x_offset_val if modalita_testo == "Rimuovi e Sostituisci Anno" else 0, 
+                y_offset=y_offset_val if modalita_testo == "Rimuovi e Sostituisci Anno" else 0
             )
-            
-            if mostra_debug:
-                st.warning("🛑 Sei in modalità MIRINO. Il mockup sotto NON verrà generato finché non spegni il mirino. Regola gli slider finché il quadrato ROSSO avvolge SOLO l'anno, non il titolo!")
-                st.image(d_img, caption="Anteprima Mirino - Regola gli slider", width=500)
-            else:
-                st.success("Anteprima: Testo modificato!")
-                st.image(d_img, caption="Design Finale", width=300)
+            st.success("Testo isolato e modificato in automatico!")
+            st.image(d_img, caption="Design Processato", width=300)
 
-        # Non generare i mockup del libro se siamo in modalità debug, sprechiamo solo risorse visive
-        mostra_mockups = not (modalita_testo != "Nessuna modifica" and mostra_debug)
-        
-        if mostra_mockups:
-            cols = st.columns(4)
-            for i, (t_name, t_img) in enumerate(libreria[scelta].items()):
-                with cols[i%4]:
-                    res = composite_v3_fixed(t_img, d_img, t_name)
-                    st.image(res, caption=t_name, use_column_width=True)
+        cols = st.columns(4)
+        for i, (t_name, t_img) in enumerate(libreria[scelta].items()):
+            with cols[i%4]:
+                res = composite_v3_fixed(t_img, d_img, t_name)
+                st.image(res, caption=t_name, use_column_width=True)
     
     st.divider()
     
     batch = st.file_uploader("Batch Produzione (Zippa tutto)", accept_multiple_files=True)
     if st.button("🚀 GENERA TUTTI (BATCH)") and batch and libreria[scelta]:
-        if modalita_testo != "Nessuna modifica" and mostra_debug:
-            st.error("Spegnere l'interruttore 'MOSTRA MIRINO DI PRECISIONE' prima di lanciare il Batch!")
-        else:
-            zip_buf = io.BytesIO()
-            with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED) as zf:
-                progress = st.progress(0)
-                total = len(batch) * len(libreria[scelta])
-                count = 0
-                for b_file in batch:
-                    b_img = Image.open(b_file)
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "a", zipfile.ZIP_DEFLATED) as zf:
+            progress = st.progress(0)
+            total = len(batch) * len(libreria[scelta])
+            count = 0
+            for b_file in batch:
+                b_img = Image.open(b_file)
+                
+                if modalita_testo != "Nessuna modifica":
+                    azione_passata = "Sostituisci" if modalita_testo == "Rimuovi e Sostituisci Anno" else "Rimuovi"
+                    font_to_pass = loaded_font if modalita_testo == "Rimuovi e Sostituisci Anno" else None
                     
-                    if modalita_testo != "Nessuna modifica":
-                        azione_passata = "Sostituisci" if modalita_testo == "Rimuovi e Sostituisci" else "Rimuovi"
-                        font_to_pass = loaded_font if modalita_testo == "Rimuovi e Sostituisci" else None
-                        
-                        b_img = elabora_testo_smart(
-                            b_img, cens_x1, cens_x2, cens_y1, cens_y2, samp_x, samp_y, 
-                            azione=azione_passata, new_text_str=new_text_input if modalita_testo == "Rimuovi e Sostituisci" else "", 
-                            font_obj=font_to_pass, x_offset=x_offset_val if modalita_testo == "Rimuovi e Sostituisci" else 0, 
-                            y_offset=y_offset_val if modalita_testo == "Rimuovi e Sostituisci" else 0,
-                            debug_mode=False
-                        )
+                    b_img = elabora_testo_dinamico(
+                        b_img, samp_x, samp_y, 
+                        azione=azione_passata, 
+                        new_text_str=new_text_input if modalita_testo == "Rimuovi e Sostituisci Anno" else "", 
+                        font_obj=font_to_pass, 
+                        x_offset=x_offset_val if modalita_testo == "Rimuovi e Sostituisci Anno" else 0, 
+                        y_offset=y_offset_val if modalita_testo == "Rimuovi e Sostituisci Anno" else 0
+                    )
 
-                    base_name = os.path.splitext(b_file.name)[0]
-                    if base_name.lower().endswith('.png'):
-                        base_name = base_name[:-4]
-                    
-                    for t_name, t_img in libreria[scelta].items():
-                        res = composite_v3_fixed(t_img, b_img, t_name)
-                        is_tmpl_png = t_name.lower().endswith('.png') or res.mode == 'RGBA'
-                        save_fmt = 'PNG' if is_tmpl_png else 'JPEG'
-                        save_ext = '.png' if is_tmpl_png else '.jpg'
-                        buf = io.BytesIO()
-                        if save_fmt == 'PNG':
-                            res.save(buf, format='PNG')
-                        else:
-                            res.save(buf, format='JPEG', quality=95)
-                        t_clean = os.path.splitext(t_name)[0]
-                        if t_clean.lower().endswith('.png'):
-                            t_clean = t_clean[:-4]
-                        zf.writestr(f"{base_name}/{t_clean}{save_ext}", buf.getvalue())
-                        count += 1
-                        progress.progress(count/total)
-            st.session_state.zip_ready = True
-            st.session_state.zip_data = zip_buf.getvalue()
-            st.success("Batch Completato! Modifiche applicate a tutti i file.")
-        
-        if st.session_state.get('zip_ready'):
-            st.download_button("📥 SCARICA ZIP", st.session_state.zip_data, f"Mockups_{scelta}.zip", "application/zip")
+                base_name = os.path.splitext(b_file.name)[0]
+                if base_name.lower().endswith('.png'):
+                    base_name = base_name[:-4]
+                
+                for t_name, t_img in libreria[scelta].items():
+                    res = composite_v3_fixed(t_img, b_img, t_name)
+                    is_tmpl_png = t_name.lower().endswith('.png') or res.mode == 'RGBA'
+                    save_fmt = 'PNG' if is_tmpl_png else 'JPEG'
+                    save_ext = '.png' if is_tmpl_png else '.jpg'
+                    buf = io.BytesIO()
+                    if save_fmt == 'PNG':
+                        res.save(buf, format='PNG')
+                    else:
+                        res.save(buf, format='JPEG', quality=95)
+                    t_clean = os.path.splitext(t_name)[0]
+                    if t_clean.lower().endswith('.png'):
+                        t_clean = t_clean[:-4]
+                    zf.writestr(f"{base_name}/{t_clean}{save_ext}", buf.getvalue())
+                    count += 1
+                    progress.progress(count/total)
+        st.session_state.zip_ready = True
+        st.session_state.zip_data = zip_buf.getvalue()
+        st.success("Batch Completato! Ogni anno è stato rilevato e allineato dinamicamente.")
+    
+    if st.session_state.get('zip_ready'):
+        st.download_button("📥 SCARICA ZIP", st.session_state.zip_data, f"Mockups_{scelta}.zip", "application/zip")
