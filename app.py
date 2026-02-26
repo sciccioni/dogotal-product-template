@@ -179,7 +179,7 @@ def elabora_testo_dinamico(img_pil, azione="Rimuovi",
             tb = font.getbbox(new_text_str)
             tw, th = tb[2]-tb[0], tb[3]-tb[1]
             draw_x = x2 - tw
-            draw_y = y1 + (bbox_h - th) // 2 - 35
+            draw_y = y1 + (bbox_h - th) // 2 - 25
             draw.text((draw_x, draw_y), new_text_str, font=font, fill=text_color)
         except Exception as e:
             st.warning(f"Errore font: {e}")
