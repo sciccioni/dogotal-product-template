@@ -178,11 +178,13 @@ def elabora_testo_dinamico(img_pil, azione="Rimuovi",
     if azione == "Sostituisci" and new_text_str and font_file_bytes:
         try:
             if font_size is None:
+                # Limita altezza max a 80px per evitare font giganti da fallback
+                max_h = min(bbox_h, 80)
                 fs = 8
                 while fs < 500:
                     font = ImageFont.truetype(io.BytesIO(font_file_bytes), fs)
                     tb = font.getbbox(new_text_str)
-                    if (tb[3]-tb[1]) >= bbox_h * 0.85: break
+                    if (tb[3]-tb[1]) >= max_h * 0.85: break
                     fs += 1
             else:
                 fs = font_size
